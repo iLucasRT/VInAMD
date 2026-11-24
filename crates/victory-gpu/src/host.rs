@@ -574,8 +574,15 @@ fn create() -> windows::core::Result<Host> {
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
         {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            // `VICTORY_HOST_WAVE=32`: compute programs translated as for a 32-lane host (NVIDIA's
+            // forms) on a host of 64-lane waves too
+            let lanes = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(o1.WaveLaneCountMax);
+            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, compute = lanes, "host wave lanes");
+            victory_shader::emit::set_host_max_wave(lanes);
+            victory_shader::emit::set_host_pixel_wave(o1.WaveLaneCountMax);
         }
         // Wave operations that include helper lanes need shader model 6.7.
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_7 };
