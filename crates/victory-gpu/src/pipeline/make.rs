@@ -130,6 +130,45 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// At a present before the world: waits, up to ten seconds a present, for
+/// the pipelines an earlier run drew with ([`early`]) to be made. A pass the
+/// title runs once is lost if its pipeline is still being made then, and
+/// stays lost for the run: with cold caches the first gameplay room came
+/// out without its lamps and with grey clothes. The title's own watchdogs
+/// allow a frame more than ten seconds.
+/// `VICTORY_PREWARM=0` does not wait.
+pub(crate) fn prewarm() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static WORLD: AtomicBool = AtomicBool::new(false);
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    // A frame of the world draws thousands; menus and loading draw tens.
+    const WORLD_DRAWS: u64 = 500;
+    const MOST: Duration = Duration::from_secs(10);
+    let now = crate::draw::drawn();
+    if now - DRAWN.swap(now, Ordering::Relaxed) >= WORLD_DRAWS {
+        WORLD.store(true, Ordering::Relaxed);
+    }
+    if WORLD.load(Ordering::Relaxed)
+        || waiting() < 16
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_PREWARM").is_none_or(|v| v != "0"))
+    {
+        return;
+    }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while waiting() >= 16 {
+        let rest = MOST.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        let nap = rest.min(Duration::from_millis(100));
+        held = done.wait_timeout(held, nap).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    tracing::info!(waiting = waiting(), "waited for pipelines before the world");
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
