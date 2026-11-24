@@ -76,7 +76,7 @@ What we checked ourselves on the RX 9070 XT, and what the fork's author reports.
 
 | Feature | Status | Notes |
 |---|---|---|
-| Xbox controller (XInput), wired or wireless | Works | Menus and gameplay input; vibration works (checked on our earlier builds) |
+| Xbox controller (XInput) | Works | Menus and gameplay input, vibration; checked on our earlier builds, not yet re-checked on Lab 23 |
 | Controller plugged in after launch | Not yet | The game only sees controllers connected before it starts: plug in first, then launch |
 | Keyboard and mouse for gameplay | Not yet | Planned (VIctory #1529); today the game asks for a controller |
 | Sony DualSense (PS5) controller | Not yet | Planned (VIctory #1517) |
@@ -100,7 +100,7 @@ What we checked ourselves on the RX 9070 XT, and what the fork's author reports.
 |---|---|---|
 | Boot, legal and first-boot screens | Works | |
 | Intro video with sound | Works | |
-| Menus in French (and other languages) | Works | Checked in French |
+| Game menus in French | Works | Other languages not tested by us |
 | Accessibility: high-contrast option | Works | Makes the scene easiest to read today |
 | Opening scene, audio and subtitles | Works | |
 | Mission objectives | Works | Shown on screen |
