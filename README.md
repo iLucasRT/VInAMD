@@ -68,6 +68,46 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 
 **Known problem on our machine:** committed memory keeps growing (the fork's author reports ~24 GB on an RTX 4070). Close other programs, keep a large page file, and expect a stop after several minutes. We're working on it.
 
+## Features (Lab 23)
+
+What we checked ourselves on the RX 9070 XT, and what the fork's author reports. "Not tested" means we have no evidence either way yet.
+
+### Controls
+
+| Feature | Status | Notes |
+|---|---|---|
+| Xbox controller (XInput), wired or wireless | Works | Menus and gameplay input; vibration works (checked on our earlier builds) |
+| Controller plugged in after launch | Not yet | The game only sees controllers connected before it starts: plug in first, then launch |
+| Keyboard and mouse for gameplay | Not yet | Planned (VIctory #1529); today the game asks for a controller |
+| Sony DualSense (PS5) controller | Not yet | Planned (VIctory #1517) |
+| Scripted key presses for testing (`VICTORY_KEYS`) | Works | Used by our test script |
+
+### Display
+
+| Feature | Status | Notes |
+|---|---|---|
+| Windowed mode | Works | Resizable; can be moved to any monitor |
+| Fullscreen (Alt+Enter) | Not yet | Freezes the picture in the world; stay windowed |
+| Ultrawide and multi-monitor desktops | Works | Run on a 5120×1440 + 2560×1440 setup, window on either screen |
+| Frame rate in menus | Works | 30 fps, the game's own cap |
+| Frame rate in the world | Partial | ~2 fps after warm-up |
+| First gameplay scene drawn | Partial | Characters, buildings and the yard; areas in shadow stay dark (ray-traced lighting not implemented) |
+| HDR | Not tested | |
+
+### Game
+
+| Feature | Status | Notes |
+|---|---|---|
+| Boot, legal and first-boot screens | Works | |
+| Intro video with sound | Works | |
+| Menus in French (and other languages) | Works | Checked in French |
+| Accessibility: high-contrast option | Works | Makes the scene easiest to read today |
+| Opening scene, audio and subtitles | Works | |
+| Mission objectives | Works | Shown on screen |
+| Pause menu, HUD | Reported | By the fork's author on an RTX 4070; not checked by us yet |
+| Autosave and loading a checkpoint | Reported | By the fork's author; not checked by us yet |
+| Long sessions | Partial | Our run stopped at 8.5 min (memory growth); Lab 24 targets this |
+
 ## What's inside
 
 - The [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork at `578d459` (VIctory `main` `ffe310e` + one commit with its rendering, shader and speed fixes), unchanged. All credit to its author.
