@@ -714,7 +714,41 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    note_pages(&request);
     queue(this, Command::Read(request));
+}
+
+/// Diagnostics: the page numbers a request named when it was enqueued, by
+/// the address of its array and its source offset: the array is read when
+/// the request runs, and it is the title's memory.
+#[cfg(feature = "diagnostics")]
+static ENQUEUED: Mutex<std::collections::BTreeMap<(usize, u64), Vec<usize>>> = Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(feature = "diagnostics")]
+fn note_pages(request: &Request) {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return;
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    let n = (offset + request.destination_size as usize).div_ceil(PAGE);
+    // SAFETY: as in `into_destination`.
+    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), n) }.to_vec();
+    let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
+    if all.len() > 1 << 16 {
+        all.clear();
+    }
+    all.insert((request.destination as usize, request.offset), pages);
+}
+
+/// Diagnostics: what [`note_pages`] noted for `request`, if its pages have
+/// changed since.
+#[cfg(feature = "diagnostics")]
+fn changed_pages(request: &Request, pages: &[usize]) -> Option<Vec<usize>> {
+    let all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
+    all.get(&(request.destination as usize, request.offset))
+        .filter(|then| then.as_slice() != pages)
+        .cloned()
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -972,6 +1006,21 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
+    #[cfg(feature = "diagnostics")]
+    if let Some(then) = changed_pages(request, pages) {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 40 || n.is_power_of_two() {
+            tracing::warn!(
+                n,
+                len,
+                enqueued = format_args!("{then:x?}"),
+                now = format_args!("{pages:x?}"),
+                still_known = then.len() - super::xmem::unknown_pages(&then).len(),
+                "dstorage: a request's page numbers changed between its enqueueing and its run"
+            );
+        }
+    }
     super::xmem::pages_written(pages, offset, len);
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         let filled = fill(window.bytes()).map(drop);
