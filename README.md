@@ -88,7 +88,8 @@ What we checked ourselves on the RX 9070 XT, and what the fork's author reports.
 |---|---|---|
 | Windowed mode | Works | Resizable; can be moved to any monitor |
 | Fullscreen (Alt+Enter) | Not yet | Freezes the picture in the world; stay windowed |
-| Ultrawide and multi-monitor desktops | Works | Run on a 5120×1440 + 2560×1440 setup, window on either screen |
+| Multi-monitor desktops | Works | The window can be placed on any screen |
+| Ultrawide (21:9, 32:9) picture | Not tested | Only run in a window so far |
 | Frame rate in menus | Works | 30 fps, the game's own cap |
 | Frame rate in the world | Partial | ~2 fps after warm-up |
 | First gameplay scene drawn | Partial | Characters, buildings and the yard; areas in shadow stay dark (ray-traced lighting not implemented) |
