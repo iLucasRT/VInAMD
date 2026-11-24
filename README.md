@@ -53,14 +53,14 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 
 **Not playable.** Measured on our machine (Windows 11, AMD Radeon RX 9070 XT, Ryzen 7 9800X3D, 32 GB RAM):
 
-| Stage | VIctory `main` | KLBF Lab (this branch) |
-|---|---|---|
-| Boot, first-boot screens, intro video, start screen | 30 fps | 30 fps |
-| Loading into the world (~50 s) | works | works |
-| The opening scene | reached; GPU timeout after 3–4 s | plays |
-| The first gameplay scene | not reached | **drawn**: characters, buildings, the yard (seen with the game's high-contrast option on) |
-| Speed in the world | – | ~2 fps after warm-up (~520–550 ms/frame) |
-| Stability | – | no device removal; **the run stopped at 514 s when Windows ran out of virtual memory** (the process committed ~104 GB) |
+| Stage | KLBF Lab (this branch), on our RX 9070 XT |
+|---|---|
+| Boot, first-boot screens, intro video, start screen | 30 fps |
+| Loading into the world (~50 s) | works |
+| The opening scene | plays |
+| The first gameplay scene | **drawn**: characters, buildings, the yard (seen with the game's high-contrast option on) |
+| Speed in the world | ~2 fps after warm-up (~520–550 ms/frame) |
+| Stability | no device removal; **the run stopped at 514 s when Windows ran out of virtual memory** (the process committed ~104 GB) |
 
 **Known problem on our machine:** committed memory keeps growing (the fork's author reports ~24 GB on an RTX 4070). Close other programs, keep a large page file, and expect a stop after several minutes. We're working on it.
 
