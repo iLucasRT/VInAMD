@@ -8,6 +8,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/current%20version-Lab%2023-ff5fa2" alt="current version: Lab 23">
+  <img src="https://img.shields.io/badge/%F0%9F%A7%AA%20brewing-Lab%2024%20%26%2025-7c3aed" alt="brewing: Lab 24 and 25">
   <a href="https://github.com/Marvisak/VIctory"><img src="https://img.shields.io/badge/based%20on-VIctory-1f46c8" alt="based on VIctory"></a>
   <img src="https://img.shields.io/badge/tested%20on-AMD%20RX%209070%20XT-c04fb0" alt="tested on RX 9070 XT">
   <img src="https://img.shields.io/badge/AMD-first%20gameplay%20scene%20drawn-ffb000" alt="first gameplay scene drawn on AMD">
@@ -49,6 +50,8 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 
 > [!NOTE]
 > **Current version: Lab 23.** This branch is the [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork, unchanged, plus our docs. All rendering work here is by its author (see [README.fxceless.md](README.fxceless.md)). We tested it on AMD: it draws the first gameplay scene on an RX 9070 XT. Our own fixes go on top in the next builds; the previous KLBF stack is kept as the tag `klbf-lab-15`.
+>
+> 🧪 **Brewing in the lab:** Lab 24 (stop the memory growth so a run lasts) and Lab 25 (our shader fixes on top, for more fps). They replace this version once one passes a full run.
 
 ## Status
 
