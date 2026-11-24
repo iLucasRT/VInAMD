@@ -73,7 +73,7 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 - The [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork at `578d459` (VIctory `main` `ffe310e` + one commit with its rendering, shader and speed fixes), unchanged. All credit to its author.
 - Our docs: this README, [docs/klbf/results.md](docs/klbf/results.md), [docs/klbf/run-test.ps1](docs/klbf/run-test.ps1).
 
-Earlier KLBF versions (older, kept for reference) are tags:
+Patch notes for every version: [CHANGELOG.md](CHANGELOG.md). Earlier KLBF versions (older, kept for reference) are tags:
 - `klbf-lab-15`: the AnyXboxX integration + #431 + #67 (25 min with no device removal, ~1 fps, dark world).
 - `klbf-lab-03`: VIctory `main` + #452, #431, #67, #584, #493 (1,006 s, black world).
 
