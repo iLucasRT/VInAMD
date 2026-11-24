@@ -1072,6 +1072,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn cross_lane_ops_on_pre_section_vgpr_do_not_collapse_to_identity() {
         let sop1 = |op: u32, sdst: u32, ssrc0: u32| 0xBE80_0000 | sdst << 16 | op << 8 | ssrc0;
         let vop1 = |op: u32, vdst: u32, src0: u32| 0x7E00_0000 | vdst << 17 | op << 9 | src0;
