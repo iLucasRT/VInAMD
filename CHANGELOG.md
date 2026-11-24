@@ -15,7 +15,7 @@ Product and controller names (Xbox, DualSense…) are only used to say what a bu
 
 ## Lab 21 / 22 — 24 Nov 2026 (test builds, not published)
 - Shader coverage fixes on the Lab 15 base: #1250, #1230, #1273, #1301 (+ two renamed instructions), then #1130, #298, #1074, #385, #1412, #953, #539, #704 + #193.
-- **Result:** ~3 fps (≈330 ms/frame) in the first gameplay scene, mission objective shown, picture still dark.
+- **Result (Lab 21):** 25 min with no device removal, median 283 ms/frame (~3.5 fps) in the first gameplay scene, mission objective shown, picture still dark.
 
 ## Lab 15 — 24 Nov 2026 (tag `klbf-lab-15`)
 - **Base:** the [AnyXboxX](https://github.com/LooperSalty/AnyXboxX) integration by LooperSalty, plus #431 (AntoninMichelq) and #67 (alessiodeia).
