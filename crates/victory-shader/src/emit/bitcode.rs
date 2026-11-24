@@ -519,6 +519,53 @@ impl Module {
         }
     }
 
+    /// Functions only blocks nothing reaches call leave the module (the
+    /// validator refuses a declaration without a use).
+    pub fn drop_unused_functions(&mut self) {
+        let (reachable, _) = self.reachable();
+        let mut used: Vec<bool> = self.funcs.iter().map(|f| f.body).collect();
+        for (b, block) in self.blocks.iter().enumerate() {
+            if !reachable[b] {
+                continue;
+            }
+            for &i in &block.body {
+                if let Op::Call(f, _) = self.insts[i as usize].op {
+                    used[f as usize] = true;
+                }
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut to = Vec::with_capacity(used.len());
+        let mut kept = 0;
+        for &u in &used {
+            to.push(kept);
+            kept += u32::from(u);
+        }
+        let mut k = 0;
+        self.funcs.retain(|_| {
+            k += 1;
+            used[k - 1]
+        });
+        self.func_ids.retain(|_, f| used[*f as usize]);
+        for f in self.func_ids.values_mut() {
+            *f = to[*f as usize];
+        }
+        // Calls of unreachable blocks keep an index that names nothing:
+        // they are never written.
+        for inst in &mut self.insts {
+            if let Op::Call(f, _) = &mut inst.op {
+                *f = to[*f as usize];
+            }
+        }
+        for md in &mut self.mds {
+            if let MdDef::Value(_, V::Func(f)) = md {
+                *f = to[*f as usize];
+            }
+        }
+    }
+
     /// Blocks reachable from entry (index 0) and their reverse postorder.
     fn reachable(&self) -> (Vec<bool>, Vec<usize>) {
         let succs = |b: usize| successors(self.blocks[b].term);
