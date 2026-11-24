@@ -1,212 +1,128 @@
-# victory-gta6
+<h1 align="center">
+  <img src="docs/klbf/logo.svg" alt="KLBF Lab" width="160">
+  <br>
+  KLBF Lab
+</h1>
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
-natively on Windows from files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+<h4 align="center">An open lab that combines the best fixes from every Xbox-to-PC compatibility project into one tested build.</h4>
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+<p align="center">
+  <a href="https://github.com/Marvisak/VIctory"><img src="https://img.shields.io/badge/based%20on-VIctory-1f46c8" alt="based on VIctory"></a>
+  <img src="https://img.shields.io/badge/tested%20on-AMD%20RX%209070%20XT-c04fb0" alt="tested on RX 9070 XT">
+  <img src="https://img.shields.io/badge/AMD-first%20gameplay%20scene%20drawn-ffb000" alt="first gameplay scene drawn on AMD">
+  <img src="https://img.shields.io/badge/license-GPL--3.0-2ea44f" alt="GPL-3.0">
+</p>
 
-## Credits
+<p align="center">
+  <a href="#why">Why</a> •
+  <a href="#status">Status</a> •
+  <a href="#whats-inside">What's inside</a> •
+  <a href="#build-and-run">Build and run</a> •
+  <a href="#results">Results</a> •
+  <a href="#testers-wanted">Testers wanted</a> •
+  <a href="#rules">Rules</a> •
+  <a href="#credits">Credits</a>
+</p>
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+> [!IMPORTANT]
+> This repository contains **no game files, keys, shaders or executables from the game**, and does not explain how to
+> get them. You need your own legally obtained copy, already readable on disk. Nothing here decrypts or works around
+> any protection. Everything a run creates stays on your PC: never share it.
 
-## Status of this fork (2026-11-25)
+## Why
 
-**Not playable yet: about 3 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
+Several open-source teams are working out, in public, how a modern console game can run natively on a PC: how its
+graphics commands, shaders, memory and input get translated from one platform to another. It's fascinating to
+watch, and with this many people following it, now is the time to learn how these systems really work.
 
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-3.5 fps (270-450 ms per frame), from 3-6 seconds per frame at the start |
-| Stability | no driver hang or device loss in normal runs |
+**KLBF Lab is an educational project.** We read the code, build it, test it on real hardware and write down what we
+learn. Every project solves different problems. So we **pick the fixes that really move things forward, wherever
+they come from**, combine them in one build, measure it and credit the people who wrote them. We don't take sides:
+our test numbers go back to every project.
 
-### What this fork changed (summary)
+### Why a fork, and not just a branch
 
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, and the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU).
+We learn from the best projects first, VIctory above all, then XCL, Palmwave, and emulator write-ups like Xenia's and shadPS4's. But testing on one AMD card kept raising questions that no single upstream pull request answers: why the world stays black, why the GPU sits mostly idle, why one CPU thread is saturated. Answering them means trying things in a slightly different direction, measuring them, and sometimes throwing them away. That needed a place of its own, with its own build, its own test log and its own experiments, more than a branch in someone else's repository. Whatever works goes back upstream, with numbers.
 
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`, new and untested in the game).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+**Every GPU.** Our own runs happen on an AMD card, but the goal is one build that works on every GPU: AMD, NVIDIA and Intel results are all welcome, and we try not to break any of them.
 
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
+> [!NOTE]
+> **This branch (Lab 23) is the [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork, unchanged, plus our docs.** All rendering work here is by its author (see [README.fxceless.md](README.fxceless.md)). We tested it on AMD: it draws the first gameplay scene on an RX 9070 XT. Our own fixes go on top in the next builds; the previous KLBF stack is kept as the tag `klbf-lab-15`.
 
-### Known problems
+## Status
 
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
+**Not playable.** Measured on our machine (Windows 11, AMD Radeon RX 9070 XT, Ryzen 7 9800X3D, 32 GB RAM):
 
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+| Stage | VIctory `main` | KLBF Lab (this branch) |
+|---|---|---|
+| Boot, first-boot screens, intro video, start screen | 30 fps | 30 fps |
+| Loading into the world (~50 s) | works | works |
+| The opening scene | reached; GPU timeout after 3–4 s | plays |
+| The first gameplay scene | not reached | **drawn**: characters, buildings, the yard (seen with the game's high-contrast option on) |
+| Speed in the world | – | ~2 fps after warm-up (~520–550 ms/frame) |
+| Stability | – | no device removal; **the run stopped at 514 s when Windows ran out of virtual memory** (the process committed ~104 GB) |
 
----
+**Known problem on our machine:** committed memory keeps growing (the fork's author reports ~24 GB on an RTX 4070). Close other programs, keep a large page file, and expect a stop after several minutes. We're working on it.
 
-# VIctory
+## What's inside
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+- The [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork at `578d459` (VIctory `main` `ffe310e` + one commit with its rendering, shader and speed fixes), unchanged. All credit to its author.
+- Our docs: this README, [docs/klbf/results.md](docs/klbf/results.md), [docs/klbf/run-test.ps1](docs/klbf/run-test.ps1).
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+Earlier KLBF stacks are kept as tags:
+- `klbf-lab-15`: the AnyXboxX integration + #431 + #67 (25 min with no device removal, ~1 fps, dark world).
+- `klbf-lab-03`: VIctory `main` + #452, #431, #67, #584, #493 (1,006 s, black world).
 
-## Status (2026-11-23)
+## Build and run
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
-
-Tested on one machine: Windows 11, AMD RX 6700 XT.
-
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+Same requirements as VIctory: Windows 10/11 x64, an AVX2 CPU, a Direct3D 12 GPU with shader model 6.6 and mesh
+shaders, Rust. See [README.fxceless.md](README.fxceless.md) (it includes the original VIctory README) for the full setup (`victory.toml`, paths, controls).
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-```
-
-Run the title:
-
-```powershell
-cargo build --release -p victory
+git clone -b klbf-lab https://github.com/PastiiJay/klbf-lab
+cd klbf-lab
+copy victory.example.toml victory.toml        # then set your paths (outside the repo)
+cargo build --release -p victory --features diagnostics
+$env:VICTORY_D3D12_DRED = '1'                 # clearly more stable on our card
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+Tips from our runs:
+- **Stay windowed.** Alt+Enter (fullscreen) freezes the picture in the world.
+- `docs/klbf/run-test.ps1` runs a timed test and logs the caption (fps, draws per frame) every 15 s.
+- When the GPU is removed, Windows resets the display driver: the screen and mouse freeze for a moment. That's expected.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+## Results
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+Every run we made, with build and result: **[docs/klbf/results.md](docs/klbf/results.md)**.
+The same numbers are posted to the projects' own threads ([VIctory #59](https://github.com/Marvisak/VIctory/issues/59),
+[XCL #560](https://github.com/ivall/xcl/issues/560), [Palmwave #2](https://github.com/fablinoo/palmwave/issues/2)).
 
-## Commands
+## Testers wanted
 
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
+We're looking for **testers**, not chatters. Any GPU: AMD, NVIDIA or Intel.
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+1. Build the `klbf-lab` branch from source, with your own copy of the game.
+2. Run it with `docs/klbf/run-test.ps1`.
+3. [Open an issue](https://github.com/PastiiJay/klbf-lab/issues/new) with your GPU, driver, build commit, how many seconds it ran and the last error lines of the log. Text only.
 
-## Debugging
+> [!NOTE]
+> **We have no game files and will never share any. Please don't ask.**
+> **There is no Discord.** Everything happens here on GitHub, in issues and pull requests. Any server claiming to be KLBF Lab is not us.
 
-A release build has no debugging aids. Build them in with
+## Rules
 
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
+- **No game content.** No game files, extracted shaders, saves, keys, screenshots or videos in this repository, in issues or in pull requests.
+- **No ready-made binaries.** Build it yourself from source.
+- **Credit first.** Every fix keeps its author and links the original pull request.
+- **Facts, not hype.** A claim comes with a build, a GPU and a log line.
 
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+## Credits
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+All the real work belongs to the authors of [VIctory](https://github.com/Marvisak/VIctory) and of the pull requests
+listed above, and to the [XCL](https://github.com/ivall/xcl) and [Palmwave](https://github.com/fablinoo/palmwave)
+teams. KLBF Lab only selects, combines and measures.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+[GPL-3.0](LICENSE), the license of VIctory. The fork's README (with the original VIctory README below it): [README.fxceless.md](README.fxceless.md).
