@@ -48,7 +48,7 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 **Every GPU.** Our own runs happen on an AMD card, but the goal is one build that works on every GPU: AMD, NVIDIA and Intel results are all welcome, and we try not to break any of them.
 
 > [!NOTE]
-> **Current version: Lab 23.** This branch is the [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork, unchanged, plus our docs.** All rendering work here is by its author (see [README.fxceless.md](README.fxceless.md)). We tested it on AMD: it draws the first gameplay scene on an RX 9070 XT. Our own fixes go on top in the next builds; the previous KLBF stack is kept as the tag `klbf-lab-15`.
+> **Current version: Lab 23.** This branch is the [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork, unchanged, plus our docs. All rendering work here is by its author (see [README.fxceless.md](README.fxceless.md)). We tested it on AMD: it draws the first gameplay scene on an RX 9070 XT. Our own fixes go on top in the next builds; the previous KLBF stack is kept as the tag `klbf-lab-15`.
 
 ## Status
 
