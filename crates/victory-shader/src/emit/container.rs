@@ -66,6 +66,12 @@ impl SigElement {
 
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
+    signature_as(elements, input, false)
+}
+
+/// [`signature`]; as validator 1.7 and later lay it out with `names_once`:
+/// each name once, the whole padded to a multiple of 4 bytes.
+pub(crate) fn signature_as(elements: &[SigElement], input: bool, names_once: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
     out.extend(8u32.to_le_bytes());
@@ -77,9 +83,13 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
     for (i, e) in elements.iter().enumerate() {
-        let shared = (e.kind != 0)
-            .then(|| (0..i).find(|&j| elements[j].kind == e.kind))
-            .flatten();
+        let shared = if names_once {
+            (0..i).find(|&j| elements[j].name == e.name)
+        } else {
+            (e.kind != 0)
+                .then(|| (0..i).find(|&j| elements[j].kind == e.kind))
+                .flatten()
+        };
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
@@ -111,6 +121,9 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     for name in names {
         out.extend(name.as_bytes());
         out.push(0);
+    }
+    if names_once {
+        out.resize(out.len().next_multiple_of(4), 0);
     }
     out
 }

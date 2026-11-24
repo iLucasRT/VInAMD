@@ -167,6 +167,24 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether pixel shaders with wave operations are emitted for shader model
+/// 6.7, whose wave operations can include helper lanes. Off on a host that
+/// does not have it ([`no_helper_waves`]) and with `VICTORY_HELPER_WAVES=0`.
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn helper_waves() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_WAVES").is_none_or(|v| v != "0"))
+        && !NO_HELPER_WAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static NO_HELPER_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host has no shader model 6.7 ([`helper_waves`]).
+pub fn no_helper_waves() {
+    NO_HELPER_WAVES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

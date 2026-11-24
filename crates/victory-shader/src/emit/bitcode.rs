@@ -176,6 +176,9 @@ pub(crate) enum Attr {
     ReadOnly = 3,
     /// Barriers.
     NoDuplicate = 4,
+    /// `main` of a pixel shader whose wave operations include helper lanes
+    /// (shader model 6.7).
+    HelperLanes = 5,
 }
 
 struct Func {
@@ -330,6 +333,13 @@ impl Module {
         });
         self.func_ids.insert(name.into(), i);
         V::Func(i)
+    }
+
+    /// Gives the function with a body its attributes.
+    pub fn set_body_attr(&mut self, attr: Attr) {
+        for f in self.funcs.iter_mut().filter(|f| f.body) {
+            f.attr = Some(attr);
+        }
     }
 
     /// An external global of type `ty` in address space `space` (DXIL
@@ -654,9 +664,17 @@ impl Module {
             }
             w.record(3, &r);
         }
+        let helper = self.funcs.iter().any(|f| f.attr == Some(Attr::HelperLanes));
+        if helper {
+            // Kind 3: a string attribute, closed by a zero.
+            let mut r = vec![5, 0xFFFF_FFFF, 3];
+            r.extend(chars("waveops-include-helper-lanes"));
+            r.push(0);
+            w.record(3, &r);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=4 + u64::from(helper) {
             w.record(2, &[id]);
         }
         w.exit();
