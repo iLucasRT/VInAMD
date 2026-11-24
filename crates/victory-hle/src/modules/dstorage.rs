@@ -564,7 +564,11 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    #[cfg(feature = "diagnostics")]
+                    note_pages(&request, true);
+                    lane.reads.push_back((seq, request));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -715,40 +719,73 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     #[cfg(feature = "diagnostics")]
-    note_pages(&request);
+    note_pages(&request, false);
     queue(this, Command::Read(request));
 }
 
-/// Diagnostics: the page numbers a request named when it was enqueued, by
-/// the address of its array and its source offset: the array is read when
-/// the request runs, and it is the title's memory.
+/// Diagnostics: the page numbers a request names when it is enqueued and
+/// when its queue is submitted, by the address of its array and its source
+/// offset: the array is read when the request runs, and it is the title's
+/// memory.
 #[cfg(feature = "diagnostics")]
-static ENQUEUED: Mutex<std::collections::BTreeMap<(usize, u64), Vec<usize>>> = Mutex::new(std::collections::BTreeMap::new());
+#[allow(clippy::type_complexity)]
+static NOTED: Mutex<std::collections::BTreeMap<(usize, u64), (Vec<usize>, Option<Vec<usize>>)>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(feature = "diagnostics")]
-fn note_pages(request: &Request) {
+fn named_pages(request: &Request) -> Option<Vec<usize>> {
     if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
-        return;
+        return None;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let n = (offset + request.destination_size as usize).div_ceil(PAGE);
     // SAFETY: as in `into_destination`.
-    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), n) }.to_vec();
-    let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
+    Some(unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), n) }.to_vec())
+}
+
+#[cfg(feature = "diagnostics")]
+fn note_pages(request: &Request, submitted: bool) {
+    let Some(pages) = named_pages(request) else { return };
+    let mut all = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     if all.len() > 1 << 16 {
         all.clear();
     }
-    all.insert((request.destination as usize, request.offset), pages);
+    let key = (request.destination as usize, request.offset);
+    if !submitted {
+        all.insert(key, (pages, None));
+    } else if let Some(noted) = all.get_mut(&key) {
+        noted.1 = Some(pages);
+    }
 }
 
-/// Diagnostics: what [`note_pages`] noted for `request`, if its pages have
-/// changed since.
+/// Diagnostics: counts how often a running request's pages differ from
+/// what it named when enqueued and when submitted.
 #[cfg(feature = "diagnostics")]
-fn changed_pages(request: &Request, pages: &[usize]) -> Option<Vec<usize>> {
-    let all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
-    all.get(&(request.destination as usize, request.offset))
-        .filter(|then| then.as_slice() != pages)
-        .cloned()
+fn compare_pages(request: &Request, pages: &[usize]) {
+    static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let key = (request.destination as usize, request.offset);
+    let Some((enqueued, submitted)) = NOTED.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() else {
+        return;
+    };
+    let Some(submitted) = submitted else { return };
+    let all = N[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let es = enqueued != submitted;
+    let sr = submitted != pages;
+    let a = N[1].fetch_add(u64::from(es), Ordering::Relaxed) + u64::from(es);
+    let b = N[2].fetch_add(u64::from(sr), Ordering::Relaxed) + u64::from(sr);
+    let c = N[3].fetch_add(u64::from(enqueued != pages), Ordering::Relaxed);
+    if (sr && b <= 30) || all.is_power_of_two() || all.is_multiple_of(20_000) {
+        tracing::warn!(
+            all,
+            enqueued_not_submitted = a,
+            submitted_not_run = b,
+            enqueued_not_run = c,
+            enqueued = format_args!("{:x?}", &enqueued[..enqueued.len().min(3)]),
+            submitted = format_args!("{:x?}", &submitted[..submitted.len().min(3)]),
+            run = format_args!("{:x?}", &pages[..pages.len().min(3)]),
+            "dstorage: page numbers of a request over its life"
+        );
+    }
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -765,8 +802,14 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// Adds a command to the queue; blocks while the queue is full, after
+/// submitting what is enqueued. The console submits on its own at half the
+/// queue; here that comes [`GRACE`] later: Grand Theft Auto VI fills a request's array of page
+/// numbers after enqueueing it and before its own submit, and a request
+/// submitted at the half ran at once (a cached read takes no time on a PC)
+/// with the numbers an earlier request had left there, over another
+/// resource's pages: 3,958 of 100,000 requests of one run went out that
+/// early.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -782,6 +825,11 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        if !lane.unsubmitted.is_empty() {
+            lanes.submit(id);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -791,11 +839,20 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
-        scheduler.work.notify_all();
+    if lane.unsubmitted.len() == (lane.capacity / 2).max(1) {
+        std::thread::spawn(move || {
+            std::thread::sleep(GRACE);
+            let mut lanes = scheduler.lock();
+            if lanes.lanes.get(&id).is_some_and(|l| l.unsubmitted.len() >= (l.capacity / 2).max(1)) {
+                lanes.submit(id);
+                scheduler.work.notify_all();
+            }
+        });
     }
 }
+
+/// How long a queue half full waits for the title's own submit.
+const GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 extern "system" fn submit(this: QueueRef) {
     // SAFETY: as above.
@@ -1006,21 +1063,14 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    #[cfg(feature = "diagnostics")]
-    if let Some(then) = changed_pages(request, pages) {
-        static SEEN: AtomicU64 = AtomicU64::new(0);
-        let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 40 || n.is_power_of_two() {
-            tracing::warn!(
-                n,
-                len,
-                enqueued = format_args!("{then:x?}"),
-                now = format_args!("{pages:x?}"),
-                still_known = then.len() - super::xmem::unknown_pages(&then).len(),
-                "dstorage: a request's page numbers changed between its enqueueing and its run"
-            );
-        }
+    // The title may still be filling them (see `queue`).
+    const LONGEST: std::time::Duration = std::time::Duration::from_millis(250);
+    let asked = std::time::Instant::now();
+    while !super::xmem::unknown_pages(pages).is_empty() && asked.elapsed() < LONGEST {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    #[cfg(feature = "diagnostics")]
+    compare_pages(request, pages);
     super::xmem::pages_written(pages, offset, len);
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         let filled = fill(window.bytes()).map(drop);
