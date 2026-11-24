@@ -7,6 +7,7 @@
 <h4 align="center">An open lab that combines the best fixes from every Xbox-to-PC compatibility project into one tested build.</h4>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/current%20version-Lab%2023-ff5fa2" alt="current version: Lab 23">
   <a href="https://github.com/Marvisak/VIctory"><img src="https://img.shields.io/badge/based%20on-VIctory-1f46c8" alt="based on VIctory"></a>
   <img src="https://img.shields.io/badge/tested%20on-AMD%20RX%209070%20XT-c04fb0" alt="tested on RX 9070 XT">
   <img src="https://img.shields.io/badge/AMD-first%20gameplay%20scene%20drawn-ffb000" alt="first gameplay scene drawn on AMD">
@@ -47,7 +48,7 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 **Every GPU.** Our own runs happen on an AMD card, but the goal is one build that works on every GPU: AMD, NVIDIA and Intel results are all welcome, and we try not to break any of them.
 
 > [!NOTE]
-> **This branch (Lab 23) is the [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork, unchanged, plus our docs.** All rendering work here is by its author (see [README.fxceless.md](README.fxceless.md)). We tested it on AMD: it draws the first gameplay scene on an RX 9070 XT. Our own fixes go on top in the next builds; the previous KLBF stack is kept as the tag `klbf-lab-15`.
+> **Current version: Lab 23.** This branch is the [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork, unchanged, plus our docs.** All rendering work here is by its author (see [README.fxceless.md](README.fxceless.md)). We tested it on AMD: it draws the first gameplay scene on an RX 9070 XT. Our own fixes go on top in the next builds; the previous KLBF stack is kept as the tag `klbf-lab-15`.
 
 ## Status
 
@@ -69,7 +70,7 @@ We learn from the best projects first, VIctory above all, then XCL, Palmwave, an
 - The [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) fork at `578d459` (VIctory `main` `ffe310e` + one commit with its rendering, shader and speed fixes), unchanged. All credit to its author.
 - Our docs: this README, [docs/klbf/results.md](docs/klbf/results.md), [docs/klbf/run-test.ps1](docs/klbf/run-test.ps1).
 
-Earlier KLBF stacks are kept as tags:
+Earlier KLBF versions (older, kept for reference) are tags:
 - `klbf-lab-15`: the AnyXboxX integration + #431 + #67 (25 min with no device removal, ~1 fps, dark world).
 - `klbf-lab-03`: VIctory `main` + #452, #431, #67, #584, #493 (1,006 s, black world).
 
