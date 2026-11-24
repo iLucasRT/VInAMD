@@ -80,7 +80,6 @@ What we checked ourselves on the RX 9070 XT, and what the fork's author reports.
 | Controller plugged in after launch | Not yet | The game only sees controllers connected before it starts: plug in first, then launch |
 | Keyboard and mouse for gameplay | Not yet | Planned (VIctory #1529); today the game asks for a controller |
 | Sony DualSense (PS5) controller | Not yet | Planned (VIctory #1517) |
-| Scripted key presses for testing (`VICTORY_KEYS`) | Works | Used by our test script |
 
 ### Display
 
@@ -88,7 +87,7 @@ What we checked ourselves on the RX 9070 XT, and what the fork's author reports.
 |---|---|---|
 | Windowed mode | Works | Resizable; can be moved to any monitor |
 | Fullscreen (Alt+Enter) | Not yet | Freezes the picture in the world; stay windowed |
-| Multi-monitor desktops | Works | The window can be placed on any screen |
+| Playing on a second monitor | Works | In a window, moved to that screen; no spanning across monitors |
 | Ultrawide (21:9, 32:9) picture | Not tested | Only run in a window so far |
 | Frame rate in menus | Works | 30 fps, the game's own cap |
 | Frame rate in the world | Partial | ~2 fps after warm-up |
