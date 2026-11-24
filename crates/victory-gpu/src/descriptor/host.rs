@@ -509,6 +509,17 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The slots of a view heap on a host that does not cap it: more than the
+/// title's heap and the dynamic slots take (1,507,328), the last one null
+/// for view indices past the heap. Such a host was left unclamped, as AMD's
+/// driver was taken to forgive them; an RX 7900 XTX page-faulted at what
+/// would be slot 0xFF0800 of the heap (run J2).
+const WIDE_VIEWS: u32 = 1_600_000;
+
+/// The slots of a sampler heap: translated shaders clamp sampler indices to
+/// the largest heap there is, so the heap is that large.
+const SAMPLERS: u32 = 2_048;
+
 /// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
 /// and if so tells the translator now (`set_view_heap_limit`) instead of
 /// when the title's heap is made: a shader keeps the limit it was
@@ -536,8 +547,17 @@ pub(crate) fn probe_view_limit() {
         if made.is_err() {
             tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
             victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+        } else if clamp_wide() {
+            victory_shader::emit::set_view_heap_limit(WIDE_VIEWS - 1);
         }
     });
+}
+
+/// Whether view indices are clamped on a host that does not cap view heaps
+/// ([`WIDE_VIEWS`]; `VICTORY_CLAMP_VIEWS=0` does not).
+fn clamp_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_VIEWS").is_none_or(|v| v != "0"))
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made
@@ -574,8 +594,13 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
+        let whole = match sampler {
+            true => count.max(SAMPLERS),
+            false if clamp_wide() => (count + extra + 1).max(WIDE_VIEWS),
+            false => count + extra,
+        };
+        let (heap, count, size) = match make(whole) {
+            Ok(heap) => (heap, count, whole),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. The heap's last slot stays null, and shaders read it for
@@ -602,7 +627,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(size) * u64::from(step),
             u64::from(step),
             sampler,
         ));
