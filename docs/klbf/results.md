@@ -5,6 +5,7 @@ Text only, no screenshots. Times are seconds from launch; the world starts at ab
 
 | Date (UTC) | Project | Build | Result |
 |---|---|---|---|
+| 2026-11-24 20:13 | **Lab 24** | Lab 23 + memory diagnostics, with compute shader `39f0e9aeb156a61c` skipped (`VICTORY_SKIP_PIPELINES`) | **memory leak found and stopped**: that one shader never leaves the AMD driver's compiler and the process grew ~240 MB/s while it waited; skipped, committed memory stays flat at ~24.6–25.6 GB; 663 s, stopped by script, no device removal |
 | 2026-11-24 19:41 | **Lab 21** | Lab 19 + #1301 (RDNA2 opcode tables) + two renamed instructions routed | **1,505 s, stopped by script, no device removal; median 283 ms/frame in the world (~3.5 fps, 85 samples)**; mission objective shown; picture still dark |
 | 2026-11-24 19:33 | **Lab 23** | [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) `578d459`, unchanged, `VICTORY_D3D12_DRED=1` | **the first gameplay scene renders on AMD**: characters, buildings and the yard are drawn (seen with the game's high-contrast option on); 1.4 s/frame at first, then **~0.52–0.55 s/frame (~2 fps)**; no device removal; stopped at 514 s when Windows ran out of virtual memory: the process had committed ~103.6 GB (32 GB RAM + 90 GB page file; `memory allocation of 2097152 bytes failed`) |
 | 2026-11-24 19:07 | Lab 19 | Lab 17 + #1273 (real UAVs on placed textures) | 1,503 s, stopped by script, no device removal; **~500 ms/frame in the world (2 fps, 90 samples), twice as fast as Lab 15**; picture still dark |
