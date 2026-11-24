@@ -490,6 +490,35 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    /// Branches on a constant become jumps, and the edges not taken leave
+    /// the phis they fed. What only they led to is then unreachable, and
+    /// [`Self::write`] leaves it out: the lane conditions decide thousands
+    /// of branches in an unrolled decision tree
+    /// (`CS_ScreenProbes_ActivateRays`: 18,245 of 22,313 blocks), and AMD's
+    /// shader compiler took gigabytes of memory and many minutes on the
+    /// blocks nothing can enter.
+    pub fn fold_constant_branches(&mut self) {
+        for b in 0..self.blocks.len() {
+            let Some(Term::CondBr(c, t, f)) = self.blocks[b].term else {
+                continue;
+            };
+            let Some(value) = self.int_value(c) else {
+                continue;
+            };
+            let (to, dead) = if value != 0 { (t, f) } else { (f, t) };
+            self.blocks[b].term = Some(Term::Br(to));
+            if dead == to {
+                continue;
+            }
+            for k in 0..self.blocks[dead].phis.len() {
+                let phi = self.blocks[dead].phis[k];
+                if let Op::Phi(incoming) = &mut self.insts[phi as usize].op {
+                    incoming.retain(|&(_, from)| from != b);
+                }
+            }
+        }
+    }
+
     /// Blocks reachable from entry (index 0) and their reverse postorder.
     fn reachable(&self) -> (Vec<bool>, Vec<usize>) {
         let succs = |b: usize| successors(self.blocks[b].term);
@@ -1203,6 +1232,34 @@ mod tests {
         assert_ne!(fresh_42, c42);
         assert_eq!(m.int_value(c42), Some(99));
         assert_eq!(m.int_value(fresh_42), Some(42));
+    }
+
+    #[test]
+    fn a_constant_branch_leaves_the_dead_edge_and_its_blocks() {
+        let mut m = Module::default();
+        let void = m.void();
+        let fty = m.func_ty(void, vec![]);
+        m.function("main", fty, None, true);
+        let i32t = m.int(32);
+        let (entry, dead, join) = (m.new_block(), m.new_block(), m.new_block());
+        let (one, two) = (m.i32(1), m.i32(2));
+        let yes = m.bool(true);
+        m.terminate(entry, Term::CondBr(yes, join, dead));
+        m.terminate(dead, Term::Br(join));
+        let phi = m.phi(join, i32t);
+        m.set_phi(phi, vec![(one, entry), (two, dead)]);
+        m.terminate(join, Term::Ret);
+        m.fold_constant_branches();
+        assert!(matches!(m.blocks[entry].term, Some(Term::Br(t)) if t == join));
+        let (reach, _) = m.reachable();
+        assert_eq!(reach, [true, false, true]);
+        // The other way round the join loses the entry's edge.
+        let no = m.bool(false);
+        m.terminate(entry, Term::CondBr(no, join, dead));
+        m.fold_constant_branches();
+        let V::Inst(i) = phi else { unreachable!() };
+        assert!(matches!(&m.insts[i as usize].op, Op::Phi(inc) if inc[..] == [(two, dead)]));
+        assert!(m.reachable().0[dead]);
     }
 
     #[test]
