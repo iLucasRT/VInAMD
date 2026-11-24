@@ -58,6 +58,20 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// Whether every ray misses: while the programs that build the structures
+/// are off (`VICTORY_BVH_BUILDER` unset, `victory-gpu`'s `Builder`), what
+/// lies where a structure should be is whatever the memory held, and rays
+/// hit it or not by chance: lamps lit the room in one run and were wholly
+/// shadowed in the next. `VICTORY_BVH_MISS=0` walks the memory as it is.
+/// Part of the translation: the shader cache keys on both.
+/// shortcut: lamps then cast no ray-traced shadow, and bounced light and
+/// reflections see the sky and the probes alone.
+fn every_ray_misses() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let is = |name: &str, value: &str| std::env::var_os(name).is_some_and(|v| v == value);
+    !cfg!(test) && *ON.get_or_init(|| !is("VICTORY_BVH_BUILDER", "1") && !is("VICTORY_BVH_MISS", "0"))
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -122,6 +136,19 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if every_ray_misses() {
+            // A box node gives no child, any other node no hit.
+            let (c, k4, k6) = (self.cur, self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
