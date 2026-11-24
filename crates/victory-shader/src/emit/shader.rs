@@ -435,7 +435,11 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
-        self.m.fold_constant_branches();
+        // Compute programs alone: the ones drivers choke on. A pixel program
+        // that loses its last use of a feature would need its flags redone.
+        if self.threads.is_some() && self.mesh.is_none() {
+            self.m.fold_constant_branches();
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -737,6 +741,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        self.m.drop_unused_functions();
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
