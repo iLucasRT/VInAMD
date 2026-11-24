@@ -275,8 +275,7 @@ struct Lower<'a> {
     /// each 32-lane half of a host wave is a console wave of its own. Ballots, lane numbers from
     /// masks, `v_mbcnt` and lane reads are taken per half; without this the upper half saw the
     /// lower half's mask (a scalarized loop left early, a test of "no lane" true).
-    // shortcut: whole-wave reductions (`waveActiveOp`) still span the 64 lanes; split them if a
-    // count and a sum of one section turn out to disagree.
+    // Whole-wave reductions and sum prefixes are taken per half too (two host reductions).
     half_waves: bool,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
@@ -1861,52 +1860,20 @@ impl<'a> Lower<'a> {
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
-        let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
-                let r = self.s.op(
-                    c,
-                    &format!("wavePrefixOp.{sfx}"),
-                    Attr::NoUnwind,
-                    ty,
-                    121,
-                    &[arg, k0, k1],
-                );
-                if inclusive {
-                    self.s.m.bin(c, Bin::Add, r, arg)
-                } else {
-                    r
-                }
-            }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
-            (Op::Or | Op::And | Op::Xor, None) => {
-                let k = self.s.m.i8(match op {
-                    Op::And => 0,
-                    Op::Or => 1,
-                    _ => 2,
-                });
-                self.s
-                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[arg, k])
-            }
-            (_, None) => {
-                let (code, unsigned) = match op {
-                    Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
-                    Op::MinU => (2, 1),
-                    Op::MaxU => (3, 1),
-                    Op::MinI | Op::MinF => (2, 0),
-                    _ => (3, 0),
-                };
-                let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
-                self.s.op(
-                    c,
-                    &format!("waveActiveOp.{sfx}"),
-                    Attr::NoUnwind,
-                    ty,
-                    119,
-                    &[arg, k, u],
-                )
-            }
+        let r = if self.half_waves {
+            // each 32-lane half its own console wave: the other half gives the identity (a prefix
+            // only needs the lower half left out of the upper half's)
+            let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let k32 = self.s.m.i32(32);
+            let upper = self.s.m.cmp(c, pred::IUGE, lane, k32);
+            let idv = if float { self.as_float(id) } else { id };
+            let up_arg = self.s.m.select(c, upper, arg, idv);
+            let r_up = self.wave_reduce(c, op, prefix, up_arg, ty, sfx)?;
+            let lo_arg = if prefix.is_some() { arg } else { self.s.m.select(c, upper, idv, arg) };
+            let r_lo = self.wave_reduce(c, op, prefix, lo_arg, ty, sfx)?;
+            self.s.m.select(c, upper, r_up, r_lo)
+        } else {
+            self.wave_reduce(c, op, prefix, arg, ty, sfx)?
         };
         // two host waves of 32 hold the console's 64 lanes: their results combine
         let r = if self.local || self.exchange.as_ref().is_some_and(|e| e.1) {
@@ -2049,6 +2016,67 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// A whole-wave reduction (or sum prefix) of `arg` over the host wave.
+    fn wave_reduce(
+        &mut self,
+        c: usize,
+        op: super::wave::Op,
+        prefix: Option<bool>,
+        arg: V,
+        ty: super::bitcode::Ty,
+        sfx: &str,
+    ) -> Result<V, Why> {
+        use super::wave::Op;
+        let i32t = self.s.t.i32;
+        Ok(match (op, prefix) {
+            (Op::AddU | Op::AddF, Some(inclusive)) => {
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let r = self.s.op(
+                    c,
+                    &format!("wavePrefixOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    121,
+                    &[arg, k0, k1],
+                );
+                if inclusive {
+                    self.s.m.bin(c, Bin::Add, r, arg)
+                } else {
+                    r
+                }
+            }
+            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (Op::Or | Op::And | Op::Xor, None) => {
+                let k = self.s.m.i8(match op {
+                    Op::And => 0,
+                    Op::Or => 1,
+                    _ => 2,
+                });
+                self.s
+                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[arg, k])
+            }
+            (_, None) => {
+                let (code, unsigned) = match op {
+                    Op::AddU => (0, 1),
+                    Op::AddF => (0, 0),
+                    Op::MinU => (2, 1),
+                    Op::MaxU => (3, 1),
+                    Op::MinI | Op::MinF => (2, 0),
+                    _ => (3, 0),
+                };
+                let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
+                self.s.op(
+                    c,
+                    &format!("waveActiveOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    119,
+                    &[arg, k, u],
+                )
+            }
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
