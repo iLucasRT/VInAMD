@@ -955,7 +955,11 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        // Again: a copy the GPU side took meanwhile holds half of it, and
+        // guarded the range anew.
+        victory_gpu::kernel_will_write(request.destination as usize, len);
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -968,12 +972,17 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
+    super::xmem::pages_written(pages, offset, len);
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        drop(window);
+        super::xmem::pages_written(pages, offset, len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        super::xmem::pages_written(pages, offset, len);
         Ok(())
     } else {
         // Said aloud: Grand Theft Auto VI never reads a request's result
@@ -984,6 +993,7 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            unknown = format_args!("{:x?}", super::xmem::unknown_pages(pages)),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)

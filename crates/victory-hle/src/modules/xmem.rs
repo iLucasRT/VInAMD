@@ -384,6 +384,65 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every address a physical page shows at, and the page each mapped
+/// address shows, for the GPU side's write guards (`victory_gpu`
+/// `set_alias_lookup`): the title writes a page through one view (a pool)
+/// while the GPU reads it through another (its tiled heap, `map_alias`),
+/// and a read-only guard on one view does not see writes through the
+/// other. Its lock is taken last (inside `PHYSICAL` and the guards' lock)
+/// and nothing is called while it is held.
+#[derive(Default)]
+struct Aliases {
+    /// (section, page index) to the addresses showing it.
+    by_page: HashMap<(usize, usize), Vec<usize>>,
+    /// Address to (section, page index).
+    by_address: HashMap<usize, (usize, usize)>,
+}
+
+static ALIASES: LazyLock<Mutex<Aliases>> = LazyLock::new(Mutex::default);
+
+fn aliases() -> MutexGuard<'static, Aliases> {
+    ALIASES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Notes `[base, base + len)` as showing `slice` and the slices after it
+/// (`shown`), or as no longer showing them.
+fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) {
+    let section = Arc::as_ptr(&slice.section) as usize;
+    let mut a = aliases();
+    for k in 0..len / PAGE {
+        let (at, key) = (base + k * PAGE, (section, slice.index + k));
+        if shown {
+            if let Some(old) = a.by_address.insert(at, key)
+                && let Some(list) = a.by_page.get_mut(&old)
+            {
+                list.retain(|&x| x != at);
+            }
+            a.by_page.entry(key).or_default().push(at);
+        } else if a.by_address.get(&at) == Some(&key) {
+            a.by_address.remove(&at);
+            if let Some(list) = a.by_page.get_mut(&key) {
+                list.retain(|&x| x != at);
+                if list.is_empty() {
+                    a.by_page.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// The other addresses showing the physical page mapped at page address
+/// `at` (`victory_gpu`'s write guards).
+fn other_views(at: usize, out: &mut Vec<usize>) {
+    let page = at - at % PAGE;
+    let a = aliases();
+    if let Some(key) = a.by_address.get(&page)
+        && let Some(list) = a.by_page.get(key)
+    {
+        out.extend(list.iter().copied().filter(|&x| x != page));
+    }
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -534,6 +593,43 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
         }
     }
     Some(runs)
+}
+
+/// Tells the GPU side that bytes `[offset, offset + len)` of `pages` are
+/// written through a view of our own: every view of the title's that shows
+/// them is opened and counts as written, or the host's copies taken through
+/// those views keep what the pages held before. (A title's own write through
+/// one view faults into the guards; ours is not guarded.)
+pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    let Some(runs) = runs(pages, offset, len) else { return };
+    let mut shown: Vec<usize> = {
+        let a = aliases();
+        runs.iter()
+            .flat_map(|(slice, n)| {
+                let section = Arc::as_ptr(&slice.section) as usize;
+                (0..*n).map(move |k| (section, slice.index + k))
+            })
+            .filter_map(|key| a.by_page.get(&key))
+            .flatten()
+            .copied()
+            .collect()
+    };
+    shown.sort_unstable();
+    let mut i = 0;
+    while i < shown.len() {
+        let mut n = 1;
+        while i + n < shown.len() && shown[i + n] == shown[i] + n * PAGE {
+            n += 1;
+        }
+        victory_gpu::kernel_will_write(shown[i], n * PAGE);
+        i += n;
+    }
+}
+
+/// For a report: which of `pages` nothing allocated (or freed since).
+pub(crate) fn unknown_pages(pages: &[usize]) -> Vec<usize> {
+    let physical = physical();
+    pages.iter().copied().filter(|p| !physical.pages.contains_key(p)).collect()
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -740,6 +836,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    static LOOKUP: std::sync::Once = std::sync::Once::new();
+    LOOKUP.call_once(|| victory_gpu::set_alias_lookup(other_views));
+    note_aliases(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -819,6 +918,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
+        note_aliases(at, size, &slice, false);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
