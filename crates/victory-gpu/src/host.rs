@@ -2510,6 +2510,53 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     wait.met()
 }
 
+/// Since the last frame line, microseconds (even places) and times (odd ones)
+/// of the parts of the pass that makes textures picked by index ready: 0 which
+/// slots are due, 1 how much of each is mapped, 2 the host texture and its
+/// view, 3 recording its upload (with its staging buffer), 4 letting the
+/// staging buffer go; and, on all threads and wherever asked: 5 upload
+/// buffers made, 6 host textures made, 7 buffer views brought up to date, 8
+/// the spans of the copies and their refreshes noted.
+pub(crate) static PASS_PARTS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+/// Adds the time it lives to a part of [`PASS_PARTS`].
+pub(crate) struct PartTime(usize, std::time::Instant);
+
+impl PartTime {
+    pub(crate) fn new(part: usize) -> Self {
+        Self(part, std::time::Instant::now())
+    }
+}
+
+impl Drop for PartTime {
+    fn drop(&mut self) {
+        PASS_PARTS[2 * self.0].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PASS_PARTS[2 * self.0 + 1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Uploads of textures picked by index since the last frame line, (times,
+/// bytes): the first of a texture; again, with more of it mapped; again, with
+/// as much of it mapped as before.
+pub(crate) static PICKED_UPLOADS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn parts_line(frames: f64) {
+    let n: Vec<f64> = PASS_PARTS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if n[1] + n[11] + n[13] > 0.0 {
+        tracing::info!(
+            "texture pass parts per frame: which slots are due {:.1} ms; how much is mapped {:.1} ms in {:.0}; host texture and view {:.1} ms in {:.0}; upload recorded {:.1} ms in {:.0}; staging let go {:.1} ms in {:.0}; of these and elsewhere: upload buffers made {:.1} ms in {:.0}, host textures made {:.1} ms in {:.0}; buffer views {:.1} ms in {:.0}, their copies {:.1} ms",
+            n[0] / 1e3, n[2] / 1e3, n[3], n[4] / 1e3, n[5], n[6] / 1e3, n[7], n[8] / 1e3, n[9], n[10] / 1e3, n[11], n[12] / 1e3, n[13], n[14] / 1e3, n[15], n[16] / 1e3
+        );
+    }
+    let u: Vec<f64> = PICKED_UPLOADS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if u[0] + u[2] + u[4] > 0.0 {
+        tracing::info!(
+            "uploads of textures picked by index per frame: {:.1} first ones {:.1} MB; {:.1} again with more mapped {:.1} MB; {:.1} again with as much mapped {:.1} MB",
+            u[0], u[1] / 1e6, u[2], u[3] / 1e6, u[4], u[5] / 1e6
+        );
+    }
+}
+
 /// [`late_met`] without its settle: whether a bottom-of-pipe write of a
 /// flight in the air, or of one being landed, is known to meet `wait`.
 /// False says nothing about what else the flights may write there. (From
@@ -6269,6 +6316,7 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let _took = PartTime::new(5);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -6485,6 +6533,7 @@ impl Meter {
         );
         late_line(frames);
         crate::descriptor::sync_line(frames);
+        parts_line(frames);
         crate::list::self_copies_line(frames);
         #[cfg(feature = "diagnostics")]
         {

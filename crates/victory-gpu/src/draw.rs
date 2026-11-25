@@ -57,6 +57,28 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
+/// Host copies by address, each with the span of it that something names.
+type Spans = std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+
+/// `[from, to)` of `shadow` is named, too.
+fn grow(spans: &mut Spans, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: u64, to: u64) {
+    let key = std::sync::Arc::as_ptr(shadow) as usize;
+    let span = spans.entry(key).or_insert_with(|| (shadow.clone(), from, to));
+    span.1 = span.1.min(from);
+    span.2 = span.2.max(to);
+}
+
+/// Into how many parts the pass over buffer views picked by index divides
+/// them, looking at one part each time beside what changed, and keeping what
+/// they add up to (`VICTORY_HEAP_SLICES`, 16; 0: all of them every sixteenth
+/// time, and added up every time, as before).
+fn heap_slices() -> u64 {
+    static PARTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PARTS.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SLICES").ok().and_then(|v| v.trim().parse().ok()).map_or(16, |n: u64| n.min(256))
+    })
+}
+
 /// The time of a frame's uploads of textures picked by index while at most
 /// 4,000 slots are due (`VICTORY_HEAP_TEXTURES_SMOOTH_MS`, unset: as with
 /// more, `VICTORY_HEAP_TEXTURES_MS`). What does not fit waits for the next
@@ -1372,25 +1394,48 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapPass>>> =
             std::sync::Mutex::new(None);
+        // With `slices` the spans of the copies are kept too, so a pass costs
+        // what changed and one part of the views, not all of them: over
+        // 320,000 views (`VICTORY_HEAP_SYNC`) it took 80 ms of every frame
+        // to add them up again, and one pass in 16 looked at all of them.
+        #[derive(Default)]
+        struct HeapPass {
+            passes: u64,
+            ranges: Ranges,
+            /// Per host copy, at least the span its picked views cover.
+            spans: Spans,
+            /// The same, added up anew slice by slice; takes the place of
+            /// `spans` when every part has been.
+            fresh: Spans,
+        }
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let HeapPass { passes, ranges, spans: kept_spans, fresh } = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
+        let parts = heap_slices();
+        let sliced = parts > 0;
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let first = *passes == 0;
+        let slots = if sliced && !first {
+            let mut slots = changed;
+            slots.extend(host.buffer_slots_slice((*passes % parts) as u32, parts as u32));
+            slots
+        } else if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
+        let round = sliced && !first && *passes % parts == parts - 1;
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let part = crate::host::PartTime::new(7);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1423,18 +1468,28 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
+            if sliced {
+                grow(kept_spans, &shadow, address, address + len);
+                grow(fresh, &shadow, address, address + len);
+            }
             ranges.insert(index, (shadow, address, address + len));
         }
+        drop(part);
+        let part = crate::host::PartTime::new(8);
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
+        let spans: Spans = if sliced {
+            if round {
+                *kept_spans = std::mem::take(fresh);
+            }
+            kept_spans.clone()
+        } else {
+            let mut spans = Spans::new();
+            for (shadow, from, to) in ranges.values() {
+                grow(&mut spans, shadow, *from, *to);
+            }
+            spans
+        };
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
@@ -1469,6 +1524,7 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        drop(part);
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1621,6 +1677,7 @@ impl State {
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
+        let part = crate::host::PartTime::new(0);
         host.texture_slots_remapped(frame);
         #[cfg(feature = "diagnostics")]
         if crate::texture::REDO.load(Ordering::Relaxed) != 0 {
@@ -1629,6 +1686,7 @@ impl State {
             tracing::info!(phase, slots, queued, "texture slots queued again (VICTORY_REDO_TEXTURES)");
         }
         let (due, census) = host.texture_slots_due(frame, if per_frame > 192 << 20 { usize::MAX } else { 4096 });
+        drop(part);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1724,7 +1782,9 @@ impl State {
                     ahead = Some((address, resource));
                 }
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                let part = crate::host::PartTime::new(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                drop(part);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -1782,7 +1842,9 @@ impl State {
                     }
                 }
             }
+            let part = crate::host::PartTime::new(2);
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            drop(part);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1814,6 +1876,7 @@ impl State {
                 continue;
             }
             if let Some(view) = &view {
+                let _part = crate::host::PartTime::new(3);
                 readable(list, sampled.kind, view);
             }
             // A texture view the host refuses removes the device: name it.
@@ -1853,7 +1916,22 @@ impl State {
             // yet, makes it anew. (Kept for those until now: every partly
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
-            crate::texture::unstage(resource);
+            {
+                let _part = crate::host::PartTime::new(4);
+                crate::texture::unstage(resource);
+            }
+            {
+                // First, or again (with more of it mapped, or not).
+                static LAST: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                let kind = match last.get_or_insert_with(Default::default).insert(resource as usize, there) {
+                    None => 0,
+                    Some(before) if before < there => 1,
+                    Some(_) => 2,
+                };
+                crate::host::PICKED_UPLOADS[2 * kind].fetch_add(1, Ordering::Relaxed);
+                crate::host::PICKED_UPLOADS[2 * kind + 1].fetch_add(bytes, Ordering::Relaxed);
+            }
             crate::texture::note_picked(resource as usize, frame, there);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);

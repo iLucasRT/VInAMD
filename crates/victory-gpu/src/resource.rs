@@ -1751,6 +1751,7 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
+    let took = crate::host::PartTime::new(6);
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
     let made = unsafe {
@@ -1766,6 +1767,7 @@ fn host_texture(
             &mut texture,
         )
     };
+    drop(took);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
