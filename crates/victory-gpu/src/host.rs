@@ -2057,6 +2057,24 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// What stood in the way of sending submissions ahead since the last frame
+/// line ([`blocked_by`]), by the step (a copy or a fill, from where, to
+/// where, how long) and the written range it met: how often.
+#[cfg(feature = "diagnostics")]
+static BLOCKS: Mutex<std::collections::BTreeMap<(u8, usize, usize, usize, (usize, usize)), u32>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// A step was found to read or write what a flight may write ([`BLOCKS`]).
+#[cfg(feature = "diagnostics")]
+fn note_block(written: &[(usize, usize)], kind: u8, src: usize, dst: usize, len: usize) {
+    let hit = |at: usize| written.get(written.partition_point(|r| r.1 <= at)).copied().filter(|r| r.0 < at + len);
+    let met = hit(src).or_else(|| if kind == 0 { hit(dst) } else { None }).unwrap_or_default();
+    let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if blocks.len() < 4096 {
+        *blocks.entry((kind, src, dst, len, met)).or_default() += 1;
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2070,6 +2088,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
+                            #[cfg(feature = "diagnostics")]
+                            note_block(written, 0, src, dst, len);
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
@@ -2078,6 +2098,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
                         if count {
+                            #[cfg(feature = "diagnostics")]
+                            note_block(written, 1, src, 0, len);
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
@@ -2465,6 +2487,21 @@ fn late_line(frames: f64) {
         return;
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    #[cfg(feature = "diagnostics")]
+    {
+        let blocks = std::mem::take(&mut *BLOCKS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut blocks: Vec<_> = blocks.into_iter().collect();
+        blocks.sort_by_key(|b| std::cmp::Reverse(b.1));
+        for ((kind, src, dst, len, met), times) in blocks.into_iter().take(6) {
+            tracing::info!(
+                "held back {:.1}x/frame: a {} of {len:#x} bytes from {src:#x} to {dst:#x}, met {:#x}+{:#x}",
+                f64::from(times) / frames,
+                if kind == 0 { "copy" } else { "fill" },
+                met.0,
+                met.1 - met.0
+            );
+        }
+    }
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
