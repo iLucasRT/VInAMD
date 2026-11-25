@@ -25,6 +25,7 @@
 </p>
 
 <p align="center">
+  <a href="#testing-this-fork"><b>Testing this fork</b></a> •
   <a href="#why">Why</a> •
   <a href="#status">Status</a> •
   <a href="#whats-inside">What's inside</a> •
@@ -39,6 +40,78 @@
 > This repository contains **no game files, keys, shaders or executables from the game**, and does not explain how to
 > get them. You need your own legally obtained copy, already readable on disk. Nothing here decrypts or works around
 > any protection. Everything a run creates stays on your PC: never share it.
+
+## Testing this fork
+
+This is the `main` branch of **VInAMD**, a performance branch of KLBF Lab for AMD cards. Everything from [Why](#why) on
+is the KLBF Lab README and describes Lab 23, not this branch. The `klbf-og` branch is what this fork had before.
+
+### What to expect
+
+Measured on one machine only: Radeon RX 7900 XTX 24 GB, Ryzen 7 5800X3D, 64 GB of RAM, Windows 11, second launch of the
+build. Run ED2: played by hand for 903 s, up to the open world, no device removal.
+
+| Where | ms per frame (mean per minute) |
+|---|---|
+| Opening cutscene | 186-206 |
+| First mission | 94-116 |
+| Open world | 171-230 while streaming; 362 in the minute it loads, peaks up to 395 |
+
+That is one run, and every other card, driver and amount of memory is untested here.
+
+| Known problem | What to do |
+|---|---|
+| **Memory.** 34-39 GB of RAM in use, and free commit fell to 2.0 GB on a 64 GB machine | Close other programs, make the page file larger, and note the lowest `commit free` of the window caption |
+| Dark areas: ray-traced lighting is not implemented | Expected, not a bug to report |
+| The first launch compiles shaders and is slower | Judge the second launch |
+| Under 24 GB of card memory | Not tested: lower the two values below |
+| NVIDIA and Intel cards | Not tested: say so in the report |
+
+### Build and run
+
+You need your own legally obtained copy of the game, already readable on disk. Nothing here includes or downloads one.
+Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 card with shader model 6.6 and mesh shaders, and Rust
+(the version is pinned in `rust-toolchain.toml`).
+
+```powershell
+git clone -b main https://github.com/iLucasRT/VInAMD
+cd VInAMD
+copy victory.example.toml victory.toml        # then set your paths (outside the repository)
+cargo build --profile diag -p victory --features diagnostics
+```
+
+Run it with the launcher, which sets every switch ED2 had, and keep the log:
+
+```powershell
+cmd /c "powershell -NoProfile -ExecutionPolicy Bypass -File docs\klbf\play-brute-force.ps1 -Game <dump>\<title exe> > run.log 2>&1"
+```
+
+Options of the launcher:
+
+| Option | Default | For |
+|---|---|---|
+| `-CardBuffersMB` | 4096 | Title buffers kept in card memory. Try 2048 or 1024 under 16 GB |
+| `-HeapTexturesMB` | 4096 | Textures brought up to date per frame. Try 2048 or 1024 under 16 GB |
+| `-TextureThreads` | 8 | Threads that prepare textures; 0 turns them off |
+| `-HeapSync` | off | Mirrors descriptor records the game copies as bytes; cost about 35 ms a frame here |
+
+Stay in windowed mode: fullscreen (Alt+Enter) froze the picture on KLBF Lab's builds. Input is an XInput controller,
+connected before the launch, or, with none connected, the keyboard (see
+[README.fxceless.md](README.fxceless.md)). Save the game as you would: saves and `crashes.log` are in
+`%LOCALAPPDATA%\victory\data` unless `victory.toml` says otherwise.
+
+### What to report
+
+Open an issue on this fork with text only:
+
+1. Card and its memory, driver version, CPU, RAM, page file size.
+2. The commit (`git rev-parse --short HEAD`) and the launcher options used.
+3. How long it ran and how far you got; whether it closed, froze, or the card was removed.
+4. From the window caption: ms per frame, peak, GPU percentage, RAM, VRAM and lowest `commit free`, in the menu, the first
+   mission and the open world.
+5. The last 30 lines of `run.log`, after checking that it holds no personal path or name.
+
+**Never attach** game files, shaders, saves, screenshots, videos or the capture folder.
 
 ## Why
 
