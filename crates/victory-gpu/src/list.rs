@@ -222,7 +222,19 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST: u64 = 256 << 20;
+
+/// How many ([`IDLE_MOST`] says how many bytes) are kept
+/// (`VICTORY_IDLE_LISTS`, 512; it was 128). The lists of up to 256
+/// submissions' lists in the air come back a batch at a time, so past 128
+/// of them some twenty a frame were destroyed and as many made again: 5 ms
+/// a frame to make them, and as much to destroy them, on the submitting
+/// thread.
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_IDLE_LISTS").ok().and_then(|v| v.parse().ok()).unwrap_or(512))
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -250,6 +262,11 @@ fn fresh_list() -> Option<crate::host::HostList> {
     }
 }
 
+/// Since the last frame line (diagnostics): microseconds in [`recycle`], of
+/// them on threads that submit; lists, and those destroyed for want of room.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static RECYCLE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
@@ -263,7 +280,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        #[cfg(feature = "diagnostics")]
+        RECYCLE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -271,9 +290,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+        } else {
+            drop(idle);
+            #[cfg(feature = "diagnostics")]
+            RECYCLE[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // `host` is destroyed here, with nothing of ours locked.
+            drop(host);
         }
     }
 }

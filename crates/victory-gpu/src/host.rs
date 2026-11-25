@@ -2310,12 +2310,73 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Lists that have run, to be reset and kept ([`land`]).
+struct Landed(Vec<(Vec<crate::list::Detached>, Vec<usize>)>);
+
+// SAFETY: as in the line of flights, which any submitting thread or the
+// relay's takes them out of: host objects (free-threaded) and memory of
+// ours, held by nobody else once they have run.
+unsafe impl Send for Landed {}
+
+impl Landed {
+    /// Resets the lists and keeps them for reuse.
+    fn recycle(self, submitting: bool) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        for (lists, order) in self.0 {
+            crate::list::recycle(lists, &order);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let us = started.elapsed().as_micros() as u64;
+            crate::list::RECYCLE[0].fetch_add(us, Ordering::Relaxed);
+            crate::list::RECYCLE[1].fetch_add(if submitting { us } else { 0 }, Ordering::Relaxed);
+        }
+        let _ = submitting;
+    }
+}
+
+/// The thread that resets lists that have run
+/// (`VICTORY_RECYCLE_THREAD=0`: the thread that submits next, as before).
+///
+/// A list's reset frees what its commands named, and a list too many is
+/// destroyed: some 10 ms a frame on the submitting thread, the one whose
+/// time is the frame's.
+fn recycler() -> Option<&'static std::sync::mpsc::Sender<Landed>> {
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Landed>>> = OnceLock::new();
+    TO.get_or_init(|| {
+        if std::env::var_os("VICTORY_RECYCLE_THREAD").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (to, from) = std::sync::mpsc::channel::<Landed>();
+        std::thread::Builder::new()
+            .name("victory-recycle".into())
+            .spawn(move || {
+                while let Ok(landed) = from.recv() {
+                    landed.recycle(false);
+                }
+            })
+            .ok()?;
+        Some(to)
+    })
+    .as_ref()
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
     let landed = std::mem::take(&mut line().landed);
-    for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+    if landed.is_empty() {
+        return;
+    }
+    let landed = Landed(landed);
+    match recycler() {
+        Some(to) => {
+            if let Err(std::sync::mpsc::SendError(landed)) = to.send(landed) {
+                landed.recycle(true);
+            }
+        }
+        None => landed.recycle(true),
     }
 }
 
@@ -6066,6 +6127,15 @@ impl Meter {
         {
             crate::watch::log_guard_parts(frames);
             log_joined(frames);
+            let r = crate::list::RECYCLE.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "lists that have run, per frame: {:.1} ms resetting them, {:.1} ms of it on threads that submit; {:.0} lists, {:.1} destroyed \
+                 for want of room",
+                r[0] / 1e3,
+                r[1] / 1e3,
+                r[2],
+                r[3]
+            );
         }
         let gpu_busy = card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
