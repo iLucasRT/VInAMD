@@ -905,8 +905,21 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // The kernel cannot write a page the GPU side guards, and it may
+        // guard one again after it was opened for this read: then the read
+        // goes to memory of ours and is stored from here, where a guarded
+        // page faults and is opened. A request that failed for it stopped
+        // the title soon after (one run in eight).
+        return into_destination(request, size, |out| {
+            if read_into(request, out).is_err() {
+                let mut data = vec![0; size];
+                read_into(request, &mut data)?;
+                out.copy_from_slice(&data);
+                tracing::info!(size, offset = request.offset, "dstorage: a destination guarded meanwhile, written from memory of ours");
+            }
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;

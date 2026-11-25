@@ -2337,16 +2337,31 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
+        let declared: Vec<(usize, usize)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .copied()
+            .filter(|&(a, e)| a < to && e > from)
             .collect();
-        if busy.is_empty() {
+        if declared.is_empty() {
             return false;
+        }
+        // Where the shaders are expected to write, if some declared much
+        // more than that ([`Shadow::expected_writes`]).
+        let expected: Option<Vec<(usize, usize)>> = (self.card.is_some() && declared.iter().any(|r| r.1 - r.0 >= WIDE))
+            .then(|| declared.iter().flat_map(|&r| self.expected_writes(r)).collect());
+        // One range for all that a wide one holds: each was asked about and
+        // looked through by itself.
+        let mut busy: Vec<(usize, usize)> = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = declared.iter().map(|&(a, e)| (a.max(from), e.min(to))).collect();
+        ranges.sort_unstable();
+        for (a, e) in ranges {
+            match busy.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(e),
+                _ => busy.push((a, e)),
+            }
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return true;
@@ -2398,11 +2413,26 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
-                        return true;
+                    // Nothing is expected to write this page: from its
+                    // first changed byte to its last, in one copy. (A page
+                    // of constants has thousands of changed runs, and past
+                    // `runs_left` of them the flights were settled for it,
+                    // 50 ms a frame.)
+                    let free = expected.as_ref().is_some_and(|x| !x.iter().any(|&(a, b)| a < hi && b > lo));
+                    let runs = if free {
+                        first_difference(title, held)
+                            .map(|first| (first, last_difference(title, held).unwrap_or(first) + 1 - first))
+                            .into_iter()
+                            .collect()
+                    } else {
+                        changed_runs(title, held)
+                    };
+                    if !free {
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
                     }
-                    *runs_left -= runs.len();
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
