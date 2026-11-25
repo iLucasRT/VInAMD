@@ -37,13 +37,20 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What identifies this translator: the BLAKE3 of its sources (and of our
+/// executable file, with `VICTORY_SHADER_KEY=exe`, as it was before: a run
+/// with any other code of ours changed began with translating 2,900 shaders
+/// anew) and of the translation settings it runs with (the loop limit, which
+/// a diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let by_exe = std::env::var_os("VICTORY_SHADER_KEY").is_some_and(|v| v == "exe");
+        let exe = if by_exe {
+            std::env::current_exe().and_then(std::fs::read)
+        } else {
+            Ok(victory_shader::SOURCES.as_bytes().to_vec())
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -56,6 +63,10 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
+                // What the host was found to be.
+                for setting in victory_shader::emit::host_settings() {
+                    bytes.extend_from_slice(&setting.to_le_bytes());
+                }
                 // So are the switches that pick the form of a wave64 program:
                 // without them here a run with `VICTORY_WAVE_WIDE=0` was
                 // served the translations an earlier run of the same

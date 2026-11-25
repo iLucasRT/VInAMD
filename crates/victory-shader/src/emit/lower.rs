@@ -1047,7 +1047,8 @@ pub fn set_host_pixel_wave(lanes: u32) {
     HOST_PIXEL_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn host_pixel_wave() -> u32 {
+/// As [`set_host_pixel_wave`] left it.
+pub(crate) fn host_pixel_wave() -> u32 {
     HOST_PIXEL_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 

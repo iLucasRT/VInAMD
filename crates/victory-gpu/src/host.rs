@@ -171,44 +171,52 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
-/// How many submissions later than [`retire`] a texture (or what a slot
-/// showed) is let go (`VICTORY_RETIRE_LATE`, 0): to tell whether something
-/// a later submission runs still reads it. A list recorded and not
-/// submitted yet belongs to no running submission.
-fn late_by() -> u64 {
-    static BY: OnceLock<u64> = OnceLock::new();
-    *BY.get_or_init(|| std::env::var("VICTORY_RETIRE_LATE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+/// How much later than [`retire`] a texture (or what a slot showed) is let
+/// go: as many submissions (`VICTORY_RETIRE_LATE`) and, beside them, as many
+/// of the title's frames (`VICTORY_RETIRE_FRAMES`), each 0 unless set. A
+/// list recorded and not submitted yet belongs to no running submission, and
+/// may still read what was shown when it was recorded. With texture threads
+/// that lost the device in five runs of five; 240 submissions later it did
+/// not in one of 330 s.
+fn late_by() -> (u64, u64) {
+    static BY: OnceLock<(u64, u64)> = OnceLock::new();
+    *BY.get_or_init(|| {
+        let n = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+        (n("VICTORY_RETIRE_LATE"), n("VICTORY_RETIRE_FRAMES"))
+    })
 }
 
 /// [`retire_late`]'s, in the order they were retired.
-static LATE_RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+/// (submission, frame, object): both have to be reached.
+static LATE_RETIRED: Mutex<std::collections::VecDeque<(u64, u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
 
 /// [`retire`], for what shaders may read by way of a descriptor
 /// ([`late_by`]).
 pub(crate) fn retire_late<T: 'static>(object: T) {
     let by = late_by();
-    if by == 0 {
+    if by == (0, 0) {
         return retire(object);
     }
-    let at = STARTED.load(Ordering::Acquire) + by;
-    LATE_RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((at, Retired(Box::new(object))));
+    let (at, frame) = (STARTED.load(Ordering::Acquire) + by.0, crate::frame::current() + by.1);
+    LATE_RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((at, frame, Retired(Box::new(object))));
 }
 
 /// A host texture's last owner lets it go: the host object lives on as long
 /// as [`retire_late`] says.
 pub(crate) fn texture_let_go(texture: &ID3D12Resource) {
-    if late_by() != 0 {
+    if late_by() != (0, 0) {
         retire_late(texture.clone());
     }
 }
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
-    if late_by() != 0 {
+    if late_by() != (0, 0) {
         let mut gone = Vec::new();
         {
+            let frame = crate::frame::current();
             let mut late = LATE_RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-            while late.front().is_some_and(|(at, _)| *at <= finished) {
+            while late.front().is_some_and(|(at, until, _)| *at <= finished && *until <= frame) {
                 gone.extend(late.pop_front());
             }
         }
@@ -4562,7 +4570,7 @@ impl Host {
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
             let text = format!("{} lists, pipelines {pipelines:?}", runs.len());
-            text.chars().take(1200).collect()
+            text.chars().take(9000).collect()
         });
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -6997,7 +7005,7 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     // mesh draws stopped at its 45th (run 41).
     for i in from.max(done.saturating_sub(4))..to {
         let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 24 {
             continue;
         }
         shown += 1;

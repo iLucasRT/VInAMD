@@ -284,7 +284,16 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false)
+    record_clamp_as(c, l, dst, budget, src, count, spec, garbage_is_nothing())
+}
+
+/// Whether a record that asks for more than can run (a slot the title has
+/// not filled: all ones) is left empty also when it is clamped alone, not
+/// cut to the most that runs (`VICTORY_CLAMP_ZERO=1`; a window's are,
+/// always). Cut to 65,535 groups it drew that many meshlets of garbage.
+fn garbage_is_nothing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_ZERO").is_some_and(|v| v == "1"))
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of

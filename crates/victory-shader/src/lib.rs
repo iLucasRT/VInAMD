@@ -10,6 +10,9 @@ pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+
+/// What this translator's code is: a hash of its sources (`build.rs`).
+pub const SOURCES: &str = env!("VICTORY_SHADER_SOURCES");
 pub mod gfx10;
 pub mod io;
 pub mod ir;

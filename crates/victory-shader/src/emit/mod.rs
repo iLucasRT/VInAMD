@@ -117,6 +117,16 @@ pub use shader::{
     set_view_heap_limit,
 };
 
+/// What the translation depends on beside the container and the code: what
+/// the host was found to be, as it was told to the translator so far.
+pub fn host_settings() -> [u32; 3] {
+    [
+        shader::view_heap_limit(),
+        lower::host_max_wave(),
+        lower::host_pixel_wave(),
+    ]
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
