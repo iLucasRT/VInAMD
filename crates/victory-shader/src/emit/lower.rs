@@ -5538,7 +5538,7 @@ impl<'a> Lower<'a> {
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
             let bound = super::pick_bound();
-            let is_buffer = match self.picked_bound(site, src, 0, addr)? {
+            let is_buffer = match self.picked_bound(site, src, 0, addr, 0)? {
                 // A constant buffer view is read as one, below.
                 Some(inside) => {
                     let buffer = self.s.m.cmp(self.cur, pred::SGT, stride, zero);
@@ -6468,8 +6468,8 @@ impl<'a> Lower<'a> {
     /// heap by an index it computes ([`super::pick_bound`]). `u`: the
     /// unordered bit of the access's handle. A slot with a constant buffer
     /// view has no bytes per element here: such accesses are left as they
-    /// are.
-    fn picked_bound(&mut self, site: Site, src: &Source, u: u32, byte: V) -> Result<Option<V>, Why> {
+    /// are. `width`: bytes that must all lie inside (0: the first must).
+    fn picked_bound(&mut self, site: Site, src: &Source, u: u32, byte: V, width: u32) -> Result<Option<V>, Why> {
         if !super::pick_bound() {
             return Ok(None);
         }
@@ -6492,6 +6492,16 @@ impl<'a> Lower<'a> {
         let over = self.s.m.cmp(c, pred::NE, over, zero);
         let bytes = self.s.m.select(c, over, all, bytes);
         let inside = self.s.m.cmp(c, pred::IULT, byte, bytes);
+        let inside = if width > 1 {
+            // No sum that could wrap: what is left from `byte` on.
+            let left = self.s.m.bin(c, Bin::Sub, bytes, byte);
+            let need = self.s.m.i32(width);
+            let fits = self.s.m.cmp(c, pred::IUGE, left, need);
+            let no = self.s.m.bool(false);
+            self.s.m.select(c, inside, fits, no)
+        } else {
+            inside
+        };
         let constant = self.s.m.cmp(c, pred::SLT, stride, zero);
         let yes = self.s.m.bool(true);
         Ok(Some(self.s.m.select(c, constant, yes, inside)))
@@ -10198,7 +10208,14 @@ impl<'a> Lower<'a> {
         // Picked by a computed index and accessed as raw bytes: only inside
         // the view the slot holds ([`super::pick_bound`]).
         let inside = if index.is_none() && !typed && used.is_none() {
-            self.picked_bound(site, src, u, off)?
+            // A read may begin inside and end up to 12 bytes past (four
+            // dwords of a 12-byte element); what is changed must lie inside.
+            let width = match narrow {
+                Some((bits, _)) if store => bits / 8,
+                _ if store || atomic.is_some() => 4 * count,
+                _ => 0,
+            };
+            self.picked_bound(site, src, u, off, width)?
         } else {
             None
         };
