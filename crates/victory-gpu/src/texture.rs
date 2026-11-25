@@ -423,6 +423,8 @@ static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::A
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
+        crate::host::buffer_gone(&self.buffer, "a texture's staging buffer");
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
     }

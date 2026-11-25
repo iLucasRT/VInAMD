@@ -1616,6 +1616,8 @@ impl Drop for Shadow {
             crate::inplace::gone(self.window, self.len);
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::host::buffer_gone(&self.buffer, "a host copy of title memory");
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {

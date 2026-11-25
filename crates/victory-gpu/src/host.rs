@@ -209,6 +209,43 @@ pub(crate) fn texture_let_go(texture: &ID3D12Resource) {
     }
 }
 
+/// Buffers let go lately (diagnostics, with `VICTORY_D3D12_DRED`): when, on
+/// which thread, where, how long, and what; the device's removal names the
+/// one a fault lies in.
+#[cfg(feature = "diagnostics")]
+static BUFFERS_GONE: Mutex<std::collections::VecDeque<(u64, u32, String, u64, u64, &'static str)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Notes that `buffer` is let go ([`BUFFERS_GONE`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffer_gone(buffer: &ID3D12Resource, what: &'static str) {
+    if !dred_on() {
+        return;
+    }
+    // SAFETY: a live resource.
+    let (va, bytes) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let mut all = BUFFERS_GONE.lock().unwrap_or_else(|e| e.into_inner());
+    if all.len() >= 1 << 18 {
+        all.pop_front();
+    }
+    all.push_back((now_us(), thread_id(), std::thread::current().name().unwrap_or("title").to_string(), va, bytes, what));
+}
+
+/// For the removal line: what was let go lately at the faulting address.
+#[cfg(feature = "diagnostics")]
+fn buffers_gone_at(va: u64) -> String {
+    let now = now_us();
+    let all = BUFFERS_GONE.lock().unwrap_or_else(|e| e.into_inner());
+    let hits: Vec<String> = all
+        .iter()
+        .rev()
+        .filter(|b| b.3 <= va && va < b.3 + b.4)
+        .take(6)
+        .map(|b| format!("{} of {:#x} bytes, +{:#x} of it, {:.1} ms before, on thread {} ({})", b.5, b.4, va - b.3, now.saturating_sub(b.0) as f64 / 1e3, b.1, b.2))
+        .collect();
+    format!("; of {} buffers let go lately, at the fault: {hits:?}", all.len())
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     if late_by() != (0, 0) {
@@ -1488,6 +1525,13 @@ struct Chunk {
 // written only by the list that holds the chunk.
 unsafe impl Send for Chunk {}
 
+#[cfg(feature = "diagnostics")]
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        buffer_gone(&self._buffer, "a scratch chunk");
+    }
+}
+
 /// Upload chunks handed out front to back: the chunks (each with its
 /// bytes), the one in use and the bytes used in it.
 #[derive(Default)]
@@ -1869,6 +1913,10 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        for upload in &self.uploads {
+            buffer_gone(upload, "a list's own upload buffer");
+        }
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -2509,6 +2557,13 @@ impl Landed {
     }
 }
 
+/// How many submissions later lists that have run are reset
+/// (`VICTORY_LAND_LATE`, 0): an experiment.
+fn land_late() -> u64 {
+    static BY: OnceLock<u64> = OnceLock::new();
+    *BY.get_or_init(|| std::env::var("VICTORY_LAND_LATE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
 /// The thread that resets lists that have run
 /// (`VICTORY_RECYCLE_THREAD=0`: the thread that submits next, as before).
 ///
@@ -2539,10 +2594,29 @@ fn recycler() -> Option<&'static std::sync::mpsc::Sender<Landed>> {
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
     let landed = std::mem::take(&mut line().landed);
-    if landed.is_empty() {
+    if landed.is_empty() && land_late() == 0 {
         return;
     }
-    let landed = Landed(landed);
+    let landed = if land_late() == 0 {
+        Landed(landed)
+    } else {
+        // Held back: to tell whether something still runs that a flight was
+        // said to have run (`VICTORY_LAND_LATE`).
+        static HELD: Mutex<std::collections::VecDeque<(u64, Landed)>> = Mutex::new(std::collections::VecDeque::new());
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if !landed.is_empty() {
+            held.push_back((STARTED.load(Ordering::Acquire) + land_late(), Landed(landed)));
+        }
+        let mut out = Vec::new();
+        let finished = FINISHED.load(Ordering::Acquire);
+        while held.front().is_some_and(|(at, _)| *at <= finished) {
+            out.extend(held.pop_front().into_iter().flat_map(|(_, l)| l.0));
+        }
+        if out.is_empty() {
+            return;
+        }
+        Landed(out)
+    };
     match recycler() {
         Some(to) => {
             if let Err(std::sync::mpsc::SendError(landed)) = to.send(landed) {
@@ -4684,6 +4758,8 @@ impl Host {
                         text.push_str(&format!("; {}", crate::resource::let_go_lately(&names.join(" "))));
                     }
                 }
+                #[cfg(feature = "diagnostics")]
+                text.push_str(&buffers_gone_at(va));
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
             }
