@@ -5480,6 +5480,10 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // In place, where that can be taken back (`crate::usercopy`).
+    if let Some(whole) = crate::usercopy::copy(src, dst, len) {
+        return whole;
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
@@ -5519,6 +5523,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
+        if let Some(whole) = crate::usercopy::copy(from, at as *mut u8, n) {
+            return whole;
+        }
         let mut done = 0;
         if direct {
             // SAFETY: as below; the kernel checks the destination and

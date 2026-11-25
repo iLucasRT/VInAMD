@@ -776,16 +776,7 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
+        if write_faulted(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -796,6 +787,21 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// A write to `at` faulted: whether it may be tried again (the block was
+/// guarded and is open now, or is writable after all).
+pub(crate) fn write_faulted(at: usize) -> bool {
+    // Held across both checks: another thread may have opened the block
+    // since this one faulted, and a copy may have guarded it again since
+    // (then it is ours again, not read-only for some other reason).
+    let mut g = guards();
+    if open(&mut g, at, at + 1) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return true;
+    }
+    writable(at)
 }
 
 /// Whether `at` is committed read-write memory now.
