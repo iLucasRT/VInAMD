@@ -1445,8 +1445,20 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        // Bytes of texture memory staged per frame, and the time of a pass:
+        // `VICTORY_HEAP_TEXTURES_MB` and `VICTORY_HEAP_TEXTURES_MS`. What a
+        // title composes once from textures that still wait in the queue
+        // stays composed of nothing.
+        let number = |name: &str, otherwise: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(otherwise)
+        };
+        static LIMITS: std::sync::OnceLock<(u64, std::time::Duration)> = std::sync::OnceLock::new();
+        let &(per_frame, span) = LIMITS.get_or_init(|| {
+            (
+                number("VICTORY_HEAP_TEXTURES_MB", 192) << 20,
+                std::time::Duration::from_millis(number("VICTORY_HEAP_TEXTURES_MS", 250)),
+            )
+        });
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1469,7 +1481,13 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        #[cfg(feature = "diagnostics")]
+        if crate::texture::REDO.load(Ordering::Relaxed) != 0 {
+            let phase = crate::texture::REDO.swap(0, Ordering::Relaxed);
+            let [slots, queued] = host.requeue(heap, phase == 2, frame);
+            tracing::info!(phase, slots, queued, "texture slots queued again (VICTORY_REDO_TEXTURES)");
+        }
+        let (due, census) = host.texture_slots_due(frame, if per_frame > 192 << 20 { usize::MAX } else { 4096 });
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1499,10 +1517,9 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in

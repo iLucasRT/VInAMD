@@ -876,6 +876,47 @@ impl HostHeap {
         slots.len()
     }
 
+    /// Diagnostics ([`crate::texture::redo_at_present`]): queues again every
+    /// title slot that holds a view of a texture the title fills and whose
+    /// host slot is made (`made`) or is not. Returns how many, and how many
+    /// of them were in the queue already.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn requeue(&self, heap: &super::Heap, made: bool, frame: u64) -> [u64; 2] {
+        let mut slots = Vec::new();
+        {
+            let keys = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for index in 0..self.count {
+                if (keys[index as usize] != 0) != made {
+                    continue;
+                }
+                let texture = match heap.handle(index).and_then(super::view) {
+                    Some(View::Placed(false, resource, desc)) => {
+                        resource[0] != 1
+                            && crate::texture::committed(
+                                (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+                                1,
+                            )
+                    }
+                    Some(View::Shader(r, _)) => {
+                        crate::resource::buffer_bytes(r as crate::object::This).is_none()
+                            && crate::resource::title_fills(r as crate::object::This)
+                    }
+                    _ => false,
+                };
+                if texture {
+                    slots.push(index);
+                }
+            }
+        }
+        let mut queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut there = 0;
+        for &slot in &slots {
+            there += u64::from(queue.slots.contains_key(&slot));
+            queue.changed(slot, frame, frame + 1);
+        }
+        [slots.len() as u64, there]
+    }
+
     /// The memory of the texture title slot `index` views is not mapped
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot

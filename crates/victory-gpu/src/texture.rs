@@ -508,6 +508,53 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// Diagnostics: what the next texture pass queues again (2: the made slots,
+/// 3: the ones not made; 0: nothing).
+#[cfg(feature = "diagnostics")]
+pub(crate) static REDO: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Diagnostics: `VICTORY_REDO_TEXTURES=a,b,c,d` (presented frames) uploads
+/// textures again, one kind at each of the frames, to tell which of them
+/// had lost their contents: at `a` the ones draws read through tables, at
+/// `b` the made slots shaders pick by index, at `c` the slots that are not
+/// made, at `d` the ones kept as a host copy wrote them.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn redo_at_present(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static AT: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("VICTORY_REDO_TEXTURES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect()
+    });
+    let Some(phase) = at.iter().position(|&f| f == frame) else {
+        return;
+    };
+    let mut count = 0;
+    match phase {
+        0 => {
+            let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+            for s in map.iter().flat_map(|m| m.values()) {
+                *s.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
+                s.uploaded.store(false, Relaxed);
+                s.dirty.store(true, Relaxed);
+                count += 1;
+            }
+        }
+        1 | 2 => REDO.store(phase as u32 + 1, Relaxed),
+        _ => {
+            let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(set) = set.as_mut() {
+                count = set.len();
+                set.clear();
+            }
+        }
+    }
+    tracing::info!(frame, phase, count, "textures uploaded again (VICTORY_REDO_TEXTURES)");
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
