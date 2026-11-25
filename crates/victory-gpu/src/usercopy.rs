@@ -100,9 +100,39 @@ fn on() -> bool {
     })
 }
 
+/// Makes the page of `at`, whose guard our read just spent, a guard page again:
+/// the kernel's copy leaves guards alone, and they are the title's. (Until now
+/// the fault went to nobody: run RG3 ended in one.)
+///
+/// Between the fault and this, a title thread that touches the page is not
+/// told (the next touch is). One that takes the guard off itself in those
+/// microseconds finds it on again, unless it left another protection, which is
+/// put back. From VIctory 79c9b93 (TG0000).
+fn guard_again(at: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return;
+    }
+    let protect = |protection: u32| {
+        let mut old = 0;
+        // SAFETY: only the page's protection changes; fails if it is gone.
+        (unsafe { VirtualProtect(at as *const _, 1, protection, &mut old) } != 0).then_some(old)
+    };
+    if let Some(old) = protect(info.Protect | PAGE_GUARD)
+        && old & !PAGE_GUARD != info.Protect & !PAGE_GUARD
+    {
+        protect(old);
+    }
+}
+
 unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
     const ACCESS_VIOLATION: u32 = 0xC000_0005;
     const IN_PAGE_ERROR: u32 = 0xC000_0006;
+    const GUARD_PAGE: u32 = 0x8000_0001;
     const WRITE: usize = 1;
     // SAFETY: the system passes the exception being dispatched.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
@@ -115,8 +145,13 @@ unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let code = record.ExceptionCode as u32;
-    if (code != ACCESS_VIOLATION && code != IN_PAGE_ERROR) || record.NumberParameters < 2 {
+    if (code != ACCESS_VIOLATION && code != IN_PAGE_ERROR && code != GUARD_PAGE) || record.NumberParameters < 2 {
         return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // A guard of the title's: left as it was, and the copy fails (the
+    // kernel's, which the caller makes then, reads zeros there).
+    if code == GUARD_PAGE {
+        guard_again(record.ExceptionInformation[1]);
     }
     // A write to a block the copies guard opens it, and goes on.
     if code == ACCESS_VIOLATION
@@ -244,6 +279,32 @@ mod tests {
                 assert!(to[..=skew].iter().chain(&to[skew + 1 + len..]).all(|&b| b == 0xEE));
             }
         }
+    }
+
+    /// A guard page is read by no copy, and stays one: the kernel's copy leaves
+    /// it, and the process goes on.
+    #[test]
+    fn a_guard_page_stays_a_guard_page() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery};
+        let pages = holed();
+        let mut to = vec![0u8; PAGE];
+        for other in [PAGE_READWRITE, PAGE_READONLY] {
+            let mut old = 0;
+            // SAFETY: the first page, committed by `holed`.
+            assert_ne!(unsafe { VirtualProtect(pages.cast(), 1, other | PAGE_GUARD, &mut old) }, 0);
+            for _ in 0..3 {
+                let Some(read) = copy(pages, to.as_mut_ptr(), PAGE) else {
+                    release(pages);
+                    return;
+                };
+                assert!(!read);
+                // SAFETY: plain data filled in by the query of our own page.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                assert_ne!(unsafe { VirtualQuery(pages.cast(), &mut info, size_of_val(&info)) }, 0);
+                assert_eq!(info.Protect, other | PAGE_GUARD);
+            }
+        }
+        release(pages);
     }
 
     /// A page that is not there, read or written, ends the copy with a no;
