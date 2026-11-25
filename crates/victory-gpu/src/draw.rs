@@ -1684,6 +1684,21 @@ impl State {
             }
         };
         let began = Took(std::time::Instant::now());
+        let mut due = due;
+        if PASS_BUDGET.get().is_none() && crate::ahead::on() {
+            let keys: Vec<Option<crate::ahead::Key>> = due
+                .iter()
+                .map(|&(index, _)| match heap.handle(index).and_then(crate::descriptor::view) {
+                    Some(View::Placed(false, resource, desc)) => Some((u64::from(desc[10]) | u64::from(desc[11]) << 32, resource)),
+                    _ => None,
+                })
+                .collect();
+            let turns = crate::ahead::turns(&keys);
+            let mut taken: Vec<(u8, (u32, u64))> = due.into_iter().zip(turns).filter_map(|(slot, turn)| Some((turn?, slot))).collect();
+            // (Stable: in each turn the most recently written first, as before.)
+            taken.sort_by_key(|t| t.0);
+            due = taken.into_iter().map(|t| t.1).collect();
+        }
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || before + began.0.elapsed() > span {
                 break;
@@ -1706,11 +1721,7 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 if PASS_BUDGET.get().is_none() && crate::ahead::on() {
-                    let key = (address, resource);
-                    if crate::ahead::waiting(&key) {
-                        continue;
-                    }
-                    ahead = Some(key);
+                    ahead = Some((address, resource));
                 }
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);

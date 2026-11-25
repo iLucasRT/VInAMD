@@ -55,7 +55,9 @@ static MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 const MOST_JOBS: usize = 2048;
 const MOST_BYTES: u64 = 512 << 20;
 /// Frames a texture stays ready unasked (its slot was written over, say).
-const KEPT: u64 = 120;
+/// (Not many: what nothing asks for takes the place of what something does.
+/// With 120 frames 500 MB stood full and no texture was made ready.)
+const KEPT: u64 = 8;
 
 fn lock() -> MutexGuard<'static, Work> {
     WORK.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
@@ -138,9 +140,25 @@ pub(crate) enum Answer {
     Go { ours: bool },
 }
 
-/// Whether a thread has the texture now.
-pub(crate) fn waiting(key: &Key) -> bool {
-    matches!(lock().states.get(key), Some(State::Waiting))
+/// How a pass is to take due textures: those ready first, then those nobody
+/// has yet (none of them if the threads have all they may), and not at all
+/// those a thread has. For each of `keys` its turn; `None`: not now.
+pub(crate) fn turns(keys: &[Option<Key>]) -> Vec<Option<u8>> {
+    let work = lock();
+    let mut free = if BYTES.load(Ordering::Relaxed) < MOST_BYTES { MOST_JOBS.saturating_sub(work.jobs.len()) } else { 0 };
+    keys.iter()
+        .map(|key| match key.as_ref().map(|key| work.states.get(key)) {
+            // Not a placed texture: the pass does it.
+            None => Some(1),
+            Some(Some(State::Waiting)) => None,
+            Some(Some(_)) => Some(0),
+            Some(None) if free != 0 => {
+                free -= 1;
+                Some(2)
+            }
+            Some(None) => None,
+        })
+        .collect()
 }
 
 /// Asks for the texture to be made ready.
