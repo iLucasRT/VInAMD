@@ -1229,7 +1229,7 @@ impl HostHeap {
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
+                crate::host::retire_late(old);
             }
         }
     }

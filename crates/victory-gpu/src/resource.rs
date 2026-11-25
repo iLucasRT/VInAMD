@@ -1617,6 +1617,7 @@ pub(crate) fn let_go_lately(named: &str) -> String {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        crate::host::texture_let_go(&self.texture);
         #[cfg(feature = "diagnostics")]
         if crate::host::dred_on() {
             use windows::core::Interface;

@@ -305,6 +305,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     WHOLLY_CLEAN.set(false);
+    if guarded
+        && batch()
+        && let Some(answer) = ANSWERS.read().unwrap_or_else(|e| e.into_inner()).get(&(first, last))
+    {
+        WHOLLY_CLEAN.set(answer.clean);
+        return Some((answer.now, answer.written.clone()));
+    }
     // View memory, known by a guard of ours: not the kernel's to answer.
     // (The guards are taken once for the whole answer. Every refreshing
     // thread wants them at once, and three times for an answer was 22% of
@@ -647,10 +654,17 @@ fn guard(
         part(4, (waiting - asking).as_micros() as u64);
         part(3, waiting.elapsed().as_micros() as u64);
     }
+    let (written, clean) = guard_held(&mut g, start / BLOCK, end.div_ceil(BLOCK));
+    WHOLLY_CLEAN.set(clean);
+    Some((written, g))
+}
+
+/// [`guard`] of blocks `[first, last)` with the guards held: the pages
+/// written, and whether the range was wholly clean.
+fn guard_held(g: &mut Guards, first: usize, last: usize) -> (Vec<usize>, bool) {
     #[cfg(feature = "diagnostics")]
     let reading = std::time::Instant::now();
     let mut written = Vec::new();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's blocks that are not clean, in order: read off the set in
     // one pass, not looked up one block at a time. A frame asks about some
     // 10 GB of view memory, 150,000 blocks, nearly all clean: the lookups
@@ -664,10 +678,9 @@ fn guard(
         part(2, u64::from(unclean.is_empty()));
         part(13, unclean.len() as u64);
     }
-    WHOLLY_CLEAN.set(unclean.is_empty());
     if unclean.is_empty() {
         // Nothing written, mapped or new since the range was last taken.
-        return Some((written, g));
+        return (written, true);
     }
     let mut uncommitted_until = first;
     let mut to_protect = Vec::new();
@@ -699,9 +712,83 @@ fn guard(
         }
     }
     for (from, to) in block_runs(&to_protect) {
-        protect(&mut g, from, to);
+        protect(g, from, to);
     }
-    Some((written, g))
+    (written, false)
+}
+
+/// What [`writes`] says of a range, answered ahead ([`answer_ahead`]).
+struct Answer {
+    now: u64,
+    written: Vec<(usize, u64)>,
+    clean: bool,
+}
+
+/// By first and last page, until [`answered`].
+static ANSWERS: std::sync::RwLock<BTreeMap<(usize, usize), Answer>> = std::sync::RwLock::new(BTreeMap::new());
+
+/// Whether a flush's refreshes are answered for at once, before they are
+/// spread over the threads that copy (`VICTORY_GUARD_BATCH=1`).
+///
+/// Every copying thread asked the guards for its own range, one at a time
+/// behind one lock, and the thread that submits waited its turns with them:
+/// 12% of its time (run AP1, eight threads). Asked together the lock is
+/// taken once, and the threads copy.
+pub(crate) fn batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// Answers [`writes`] for `ranges` (of view memory; others are left to it)
+/// until [`answered`]. One asking for all: what one range found written is
+/// in the journal for the others.
+pub(crate) fn answer_ahead(ranges: &[(usize, usize)]) {
+    let mut pages: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE)))
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    {
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        pages.retain(|&(first, last)| !j.ahead.iter().any(|&(a, b)| a <= first && last <= b));
+    }
+    #[cfg(feature = "diagnostics")]
+    let guarding = std::time::Instant::now();
+    let mut held = guards();
+    pages.retain(|&(first, _)| known_view(&held, first * PAGE));
+    if pages.len() < 2 {
+        return;
+    }
+    install();
+    let found: Vec<(Vec<usize>, bool)> = pages.iter().map(|&(first, last)| guard_held(&mut held, first, last)).collect();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::GuardUs, guarding.elapsed().as_micros() as u64);
+        add(C::Watches, pages.len() as u64);
+        add(C::WatchUs, guarding.elapsed().as_micros() as u64);
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    for page in found.iter().flat_map(|f| &f.0) {
+        j.written.insert(*page, now);
+    }
+    // (Held until the journal has what they said: see `guarded_writes`.)
+    drop(held);
+    let mut answers = ANSWERS.write().unwrap_or_else(|e| e.into_inner());
+    for (&(first, last), (_, clean)) in pages.iter().zip(&found) {
+        let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        answers.insert((first, last), Answer { now, written, clean: *clean });
+    }
+}
+
+/// The flush is done: its answers are gone.
+pub(crate) fn answered() {
+    ANSWERS.write().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in

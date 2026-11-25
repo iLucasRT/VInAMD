@@ -2735,6 +2735,47 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// The ranges [`Shadow::update`] of this range will ask about, added to
+    /// `out` (`crate::watch::answer_ahead`).
+    pub(crate) fn asks(&self, address: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+        if self.place.is_some() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
+        let mut ask = |a: usize, b: usize| {
+            let stamp = crate::watch::stamp(a, b);
+            let spared = crate::watch::clean_stamps() == 1
+                && stamp.is_some()
+                && self.clean.lock().unwrap_or_else(|e| e.into_inner()).get(&(a, b)).copied() == stamp;
+            if !spared {
+                out.push((a, b));
+            }
+        };
+        let mut busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .filter(|&(a, e)| a < to && e > from)
+            .collect();
+        busy.sort_unstable();
+        let mut at = from;
+        for (a, e) in busy {
+            if a > at {
+                ask(at, a);
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            ask(at, to);
+        }
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {

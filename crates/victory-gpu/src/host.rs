@@ -171,8 +171,49 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// How many submissions later than [`retire`] a texture (or what a slot
+/// showed) is let go (`VICTORY_RETIRE_LATE`, 0): to tell whether something
+/// a later submission runs still reads it. A list recorded and not
+/// submitted yet belongs to no running submission.
+fn late_by() -> u64 {
+    static BY: OnceLock<u64> = OnceLock::new();
+    *BY.get_or_init(|| std::env::var("VICTORY_RETIRE_LATE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// [`retire_late`]'s, in the order they were retired.
+static LATE_RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// [`retire`], for what shaders may read by way of a descriptor
+/// ([`late_by`]).
+pub(crate) fn retire_late<T: 'static>(object: T) {
+    let by = late_by();
+    if by == 0 {
+        return retire(object);
+    }
+    let at = STARTED.load(Ordering::Acquire) + by;
+    LATE_RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((at, Retired(Box::new(object))));
+}
+
+/// A host texture's last owner lets it go: the host object lives on as long
+/// as [`retire_late`] says.
+pub(crate) fn texture_let_go(texture: &ID3D12Resource) {
+    if late_by() != 0 {
+        retire_late(texture.clone());
+    }
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
+    if late_by() != 0 {
+        let mut gone = Vec::new();
+        {
+            let mut late = LATE_RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            while late.front().is_some_and(|(at, _)| *at <= finished) {
+                gone.extend(late.pop_front());
+            }
+        }
+        drop(gone);
+    }
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
@@ -5754,12 +5795,23 @@ impl Batch {
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
+            let batch = crate::watch::batch();
+            if batch {
+                let mut asks = Vec::new();
+                for (shadow, from, to) in &self.refreshes {
+                    shadow.asks(*from, *to - *from, &mut asks);
+                }
+                crate::watch::answer_ahead(&asks);
+            }
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
                 .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
+            if batch {
+                crate::watch::answered();
+            }
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
