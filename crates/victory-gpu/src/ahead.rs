@@ -29,8 +29,9 @@ enum State {
     /// A thread has it, or will.
     Waiting,
     /// Ready since a frame; what it holds (nothing, if there was nothing to
-    /// make), and whether the staging buffer is there because of this.
-    Ready { frame: u64, held: Option<Held>, ours: bool, bytes: u64 },
+    /// make), whether the staging buffer is there because of this, and the
+    /// digest of the memory it was made of (0: not known).
+    Ready { frame: u64, held: Option<Held>, ours: bool, bytes: u64, digest: u64 },
     /// Its copy was recorded in this frame.
     Used(u64),
 }
@@ -105,30 +106,54 @@ fn work() {
         let made = prepare(&key);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let (held, ours) = match made {
-            Some((held, ours)) => (Some(held), ours),
-            None => (None, false),
+        let (held, ours, digest) = match made {
+            Some((held, ours, digest)) => (Some(held), ours, digest),
+            None => (None, false, 0),
         };
         let bytes = held.as_ref().map_or(0, |h| h.1.bytes());
         BYTES.fetch_add(bytes, Ordering::Relaxed);
-        lock().states.insert(key, State::Ready { frame: crate::frame::current(), held, ours, bytes });
+        lock().states.insert(key, State::Ready { frame: crate::frame::current(), held, ours, bytes, digest });
     }
 }
 
 /// Makes a texture ready; `None` if there is nothing to make (no memory
-/// there, the host refuses it, or its contents are the host's own).
-fn prepare(key: &Key) -> Option<(Held, bool)> {
+/// there, the host refuses it, its contents are the host's own, or the memory
+/// holds what it held when it was uploaded: the pass looks at that again).
+fn prepare(key: &Key) -> Option<(Held, bool, u64)> {
     let len = crate::resource::placed_bytes(&key.1).unwrap_or(1);
-    if crate::texture::mapped_bytes(key.0 as *const u8, len as usize) == 0 {
+    let mapped = crate::texture::mapped_bytes(key.0 as *const u8, len as usize);
+    if mapped == 0 {
         return None;
     }
     // (A placed texture's resource is ours and is never released.)
     let resource: This = crate::resource::texture_at(key.0, &key.1)?;
+    // (Looked at before the bytes are taken: one written meanwhile is found
+    // other at the next look, and uploaded again.)
+    let mut digest = 0;
+    if crate::texture::pick_digest() && digests() {
+        let there = if mapped < len { mapped } else { u64::MAX };
+        digest = crate::texture::digest(key.0 as *const u8, len as usize);
+        if digest != 0 && crate::texture::picked_digest(resource as usize, there) == digest {
+            SAME.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
     let texture = crate::resource::host_copy(resource)?;
     let (staging, made) = crate::texture::make_staging(resource, &texture.texture)?;
     staging.refresh_ahead();
-    Some(((texture, staging), made))
+    Some(((texture, staging), made, digest))
 }
+
+/// Whether the threads look at the memory's digest (`VICTORY_AHEAD_DIGEST=0`:
+/// not; every texture a thread made ready was uploaded again, the same or
+/// not).
+fn digests() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AHEAD_DIGEST").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: textures found as they were uploaded.
+static SAME: AtomicU64 = AtomicU64::new(0);
 
 /// What the pass is to do with a slot of the texture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,8 +161,9 @@ pub(crate) enum Answer {
     /// Pass it by: it is being made ready.
     Wait,
     /// Go on: it is ready (or there is nothing to make ready), and the
-    /// staging buffer is there because of it.
-    Go { ours: bool },
+    /// staging buffer is there because of it, made of memory of this digest
+    /// (0: not known).
+    Go { ours: bool, digest: u64 },
 }
 
 /// How a pass is to take due textures: those ready first, then those nobody
@@ -166,8 +192,8 @@ pub(crate) fn ask(key: &Key) -> Answer {
     let mut work = lock();
     match work.states.get(key) {
         Some(State::Waiting) => Answer::Wait,
-        Some(State::Ready { ours, .. }) => Answer::Go { ours: *ours },
-        Some(State::Used(_)) => Answer::Go { ours: true },
+        Some(State::Ready { ours, digest, .. }) => Answer::Go { ours: *ours, digest: *digest },
+        Some(State::Used(_)) => Answer::Go { ours: true, digest: 0 },
         None => {
             if work.jobs.len() < MOST_JOBS && BYTES.load(Ordering::Relaxed) < MOST_BYTES {
                 work.states.insert(*key, State::Waiting);
@@ -237,10 +263,11 @@ pub(crate) fn log(frames: f64) {
         (work.jobs.len(), work.states.len())
     };
     tracing::info!(
-        "textures made ready ahead per frame (VICTORY_TEXTURE_THREADS={}): {made:.0} in {:.1} ms of all threads; {jobs} waiting for a thread, \
+        "textures made ready ahead per frame (VICTORY_TEXTURE_THREADS={}): {made:.0} in {:.1} ms of all threads, {:.0} of them found as they were uploaded; {jobs} waiting for a thread, \
          {states} with them or ready, {} MB of staging ready",
         threads(),
         us / 1e3,
+        SAME.swap(0, Ordering::Relaxed) as f64 / frames,
         BYTES.load(Ordering::Relaxed) >> 20
     );
 }

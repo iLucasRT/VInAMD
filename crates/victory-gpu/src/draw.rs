@@ -68,11 +68,25 @@ fn grow(spans: &mut Spans, shadow: &std::sync::Arc<crate::shadow::Shadow>, from:
     span.2 = span.2.max(to);
 }
 
+/// Whether the pass over buffer views picked by index leaves to its draws what
+/// a table's slot holds (`VICTORY_HEAP_TABLES=1`: not).
+fn heap_tables_left() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TABLES").is_none_or(|v| v != "1"))
+}
+
+/// How often the slots without a host copy yet are asked again: every so many
+/// passes (`VICTORY_HEAP_RETRY`, 64).
+fn heap_retry() -> u64 {
+    static PASSES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| std::env::var("VICTORY_HEAP_RETRY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u64| n > 0).unwrap_or(64).min(1024))
+}
+
 /// Into how many parts the pass over buffer views picked by index divides
 /// those it has brought up to date, looking at one part each time beside what
 /// changed, and keeping what they add up to (`VICTORY_HEAP_SLICES`, 128; 0:
 /// all of them every sixteenth time, and added up every time, as before).
-/// Those without a host copy yet are asked again every sixteenth time. A look
+/// Those without a host copy yet are asked again every [`heap_retry`] times. A look
 /// costs some 3.5 microseconds: a sixteenth of 320,000 views was 80 ms of a
 /// frame (runs DB1, DB2).
 fn heap_slices() -> u64 {
@@ -418,6 +432,7 @@ pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// Slots whose texture another slot had uploaded since.
 pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_KEPT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_TEXTURES_CHANGING: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
@@ -1425,12 +1440,26 @@ impl State {
         let first = *passes == 0;
         let slots = if sliced && !first {
             let mut slots = changed;
-            let (part, asked) = ((*passes % parts) as u32, (*passes % 16) as u32);
-            slots.extend(
-                host.buffer_slots_some(|slot| slot % parts as u32 == part || slot % 16 == asked)
-                    .into_iter()
-                    .filter(|slot| slot % parts as u32 == part || !ranges.contains_key(slot)),
-            );
+            // The slots of tables, written anew every frame for each draw that
+            // reads them, are that draw's: it makes what its table shows in
+            // slots of its own (31,640 written a frame standing still, run EC1,
+            // at 1.6 microseconds each; `texture_slots_remapped` leaves them
+            // too). `VICTORY_HEAP_TABLES=1`: looked at all the same.
+            if heap_tables_left() {
+                let before = slots.len();
+                slots.retain(|&slot| !host.tabled_slot(slot, frame));
+                crate::host::HEAP_SLOTS[2].fetch_add((before - slots.len()) as u64, Ordering::Relaxed);
+            }
+            let retry = heap_retry();
+            let (part, asked) = ((*passes % parts) as u32, (*passes % retry) as u32);
+            crate::host::HEAP_SLOTS[0].fetch_add(slots.len() as u64, Ordering::Relaxed);
+            let more: Vec<u32> = host
+                .buffer_slots_some(|slot| slot % parts as u32 == part || slot % retry as u32 == asked)
+                .into_iter()
+                .filter(|slot| slot % parts as u32 == part || !ranges.contains_key(slot))
+                .collect();
+            crate::host::HEAP_SLOTS[1].fetch_add(more.len() as u64, Ordering::Relaxed);
+            slots.extend(more);
             slots
         } else if *passes % 16 == 0 {
             ranges.clear();
@@ -1837,6 +1866,7 @@ impl State {
                 continue;
             }
             let mut ours = false;
+            let mut made_of = 0;
             if let Some(key) = ahead {
                 // (One that another slot had uploaded is not made again.)
                 let there = partly.unwrap_or(u64::MAX);
@@ -1847,8 +1877,9 @@ impl State {
                 if !again {
                     match crate::ahead::ask(&key) {
                         crate::ahead::Answer::Wait => continue,
-                        crate::ahead::Answer::Go { ours: made } => {
+                        crate::ahead::Answer::Go { ours: made, digest } => {
                             ours = made;
+                            made_of = digest;
                             crate::ahead::used(&key);
                         }
                     }
@@ -1888,7 +1919,7 @@ impl State {
                 continue;
             }
             // Its memory holds what it held when it was uploaded.
-            let mut digest = 0;
+            let mut digest = if ours { made_of } else { 0 };
             if !tabled
                 && !ours
                 && placed.is_some()
@@ -1905,7 +1936,14 @@ impl State {
                     host.texture_slot_done(index, write, partly.map(|mapped| (frame + 1, mapped)));
                     continue;
                 }
+                // Uploaded before and other now: when it has held still.
+                if before != 0 && !crate::texture::settled(resource as usize, digest) {
+                    HEAP_TEXTURES_CHANGING.fetch_add(1, Ordering::Relaxed);
+                    host.texture_slot_done(index, write, Some((frame + 1, partly.map_or(0, |mapped| mapped.saturating_sub(1)))));
+                    continue;
+                }
             }
+            let _transient = crate::texture::transient();
             if let Some(view) = &view {
                 let _part = crate::host::PartTime::new(3);
                 readable(list, sampled.kind, view);

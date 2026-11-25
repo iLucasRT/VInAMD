@@ -2518,8 +2518,14 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
 /// buffers made, 6 host textures made, 7 buffer views brought up to date, 8
 /// the spans of the copies and their refreshes noted; 9 whether a texture's
 /// memory is as it was; 10 a texture detiled, 11 hashed (memory not watched),
-/// 12 read through a copy (on all threads).
-pub(crate) static PASS_PARTS: [std::sync::atomic::AtomicU64; 26] = [const { std::sync::atomic::AtomicU64::new(0) }; 26];
+/// 12 read through a copy (on all threads); 13 waiting for the lock on a view
+/// heap's slots, 14 host textures let go, 15 views made.
+pub(crate) static PASS_PARTS: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+
+/// Slots the pass over buffer views picked by index looked at since the last
+/// frame line: that were written, and others (a part of them, and those
+/// without a host copy), and that were left to their draws.
+pub(crate) static HEAP_SLOTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Adds the time it lives to a part of [`PASS_PARTS`].
 pub(crate) struct PartTime(usize, std::time::Instant);
@@ -2547,15 +2553,30 @@ fn parts_line(frames: f64) {
     let kept = crate::draw::HEAP_TEXTURES_KEPT.swap(0, Ordering::Relaxed) as f64 / frames;
     if n[1] + n[11] + n[13] > 0.0 {
         tracing::info!(
-            "texture pass parts per frame: whether memory is as it was {:.1} ms in {:.0} ({:.0} were); which slots are due {:.1} ms; how much is mapped {:.1} ms in {:.0}; host texture and view {:.1} ms in {:.0}; upload recorded {:.1} ms in {:.0}; staging let go {:.1} ms in {:.0}; of these and elsewhere: upload buffers made {:.1} ms in {:.0}, host textures made {:.1} ms in {:.0}; buffer views {:.1} ms in {:.0}, their copies {:.1} ms; textures detiled {:.1} ms in {:.0}, hashed {:.1} ms, read through a copy {:.1} ms",
-            n[18] / 1e3, n[19], kept, n[0] / 1e3, n[2] / 1e3, n[3], n[4] / 1e3, n[5], n[6] / 1e3, n[7], n[8] / 1e3, n[9], n[10] / 1e3, n[11], n[12] / 1e3, n[13], n[14] / 1e3, n[15], n[16] / 1e3, n[20] / 1e3, n[21], n[22] / 1e3, n[24] / 1e3
+            "texture pass parts per frame: whether memory is as it was {:.1} ms in {:.0} ({:.0} were); which slots are due {:.1} ms; how much is mapped {:.1} ms in {:.0}; host texture and view {:.1} ms in {:.0}; upload recorded {:.1} ms in {:.0}; staging let go {:.1} ms in {:.0}; of these and elsewhere: upload buffers made {:.1} ms in {:.0}, host textures made {:.1} ms in {:.0}; buffer views {:.1} ms in {:.0}, their copies {:.1} ms; textures detiled {:.1} ms in {:.0}, hashed {:.1} ms, read through a copy {:.1} ms; waited for the slots' lock {:.1} ms in {:.0}; host textures let go {:.1} ms in {:.0}; views made {:.1} ms in {:.0}",
+            n[18] / 1e3, n[19], kept, n[0] / 1e3, n[2] / 1e3, n[3], n[4] / 1e3, n[5], n[6] / 1e3, n[7], n[8] / 1e3, n[9], n[10] / 1e3, n[11], n[12] / 1e3, n[13], n[14] / 1e3, n[15], n[16] / 1e3, n[20] / 1e3, n[21], n[22] / 1e3, n[24] / 1e3, n[26] / 1e3, n[27], n[28] / 1e3, n[29], n[30] / 1e3, n[31]
         );
     }
     let [taken, made, spilled] = [0, 1, 2].map(|i| crate::texture::POOLED[i].load(Ordering::Relaxed));
+    let [carved, chunks, away] = [0, 1, 2].map(|i| crate::texture::CARVED[i].load(Ordering::Relaxed));
+    let (heaps, placed, spare) = crate::placement::stats();
+    if heaps > 0 {
+        tracing::info!("textures placed in {heaps} heaps: {} MB in use, {} MB free", placed >> 20, spare >> 20);
+    }
+    let changing = crate::draw::HEAP_TEXTURES_CHANGING.swap(0, Ordering::Relaxed) as f64 / frames;
+    if carved > 0 {
+        tracing::info!(
+            "staging carved from shared buffers since the start: {carved} pieces, {chunks} buffers of 32 MB made, {away} turned away; textures waited for while changing: {changing:.1} a frame"
+        );
+    }
     if taken + made > 0 {
         tracing::info!(
             "staging buffers since the start: {taken} used again, {made} made, {spilled} let go as too many (VICTORY_STAGING_POOL_MB)"
         );
+    }
+    let [written, others, left] = [0, 1, 2].map(|i| HEAP_SLOTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if written + others > 0.0 {
+        tracing::info!("buffer view slots looked at per frame: {written:.0} that were written, {others:.0} others; {left:.0} written left to their draws");
     }
     let u: Vec<f64> = PICKED_UPLOADS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if u[0] + u[2] + u[4] > 0.0 {

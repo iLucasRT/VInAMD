@@ -34,6 +34,9 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    /// The shared buffer it is a piece of, if it is ([`carve`]): the offsets of
+    /// `footprints` are in it.
+    chunk: Option<Piece>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -62,7 +65,7 @@ pub(crate) struct Staging {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u64; 4]>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -74,7 +77,7 @@ struct Last {
 impl Last {
     /// Takes `hash` as the hash of the texture's memory; true when it
     /// differs from the last one, and then the frame is noted.
-    fn rehash(&mut self, hash: blake3::Hash) -> bool {
+    fn rehash(&mut self, hash: [u64; 4]) -> bool {
         if self.hash == Some(hash) {
             return false;
         }
@@ -429,7 +432,9 @@ impl Drop for Staging {
         STAGED[1].fetch_sub(self.bytes, Relaxed);
         // Nothing reads it any more: a list that recorded a copy from it
         // holds this until it has run.
-        give_staging(self.buffer.clone(), self.data);
+        if self.chunk.is_none() {
+            give_staging(self.buffer.clone(), self.data);
+        }
     }
 }
 
@@ -442,12 +447,194 @@ static POOL: Mutex<(u64, std::collections::BTreeMap<u64, Vec<SpareStaging>>)> = 
 
 struct SpareStaging(ID3D12Resource, usize);
 
-/// The most bytes [`POOL`] keeps (`VICTORY_STAGING_POOL_MB`, 256; 0: none,
+/// A large upload buffer that staging buffers are carved from
+/// ([`carve`]).
+struct Chunk {
+    buffer: ID3D12Resource,
+    data: usize,
+    id: u64,
+    /// Its free ranges (offset, bytes), and a size none of them is larger than.
+    free: std::collections::BTreeMap<u64, u64>,
+    largest: u64,
+}
+
+/// The chunks made ([`carve`]), the number of the next, and the one that
+/// served last.
+struct Arena {
+    chunks: Vec<Chunk>,
+    next: u64,
+    last: usize,
+}
+
+static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new(), next: 0, last: 0 });
+
+/// A piece of a chunk: free again when it is let go. (Until now a chunk was
+/// free only once all its pieces were, and what the threads had ready held
+/// every one of them: 16 of 16 chunks, and 266,000 of 592,000 askings turned
+/// away, in the open world of run EC2.)
+pub(crate) struct Piece {
+    chunk: u64,
+    at: u64,
+    size: u64,
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let mut gone = None;
+        {
+            let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(i) = arena.chunks.iter().position(|c| c.id == self.chunk) else {
+                return;
+            };
+            let c = &mut arena.chunks[i];
+            crate::placement::give(&mut c.free, self.at, self.size);
+            c.largest = CHUNK_BYTES;
+            // An empty one past those kept goes.
+            if c.free.get(&0) == Some(&CHUNK_BYTES)
+                && arena.chunks.len() as u64 * CHUNK_BYTES > arena_kept()
+                && arena.chunks.iter().filter(|c| c.free.get(&0) == Some(&CHUNK_BYTES)).count() > 4
+            {
+                gone = Some(arena.chunks.swap_remove(i));
+                arena.last = 0;
+            }
+        }
+        // (Outside the lock: freeing a buffer takes the host a while.)
+        drop(gone);
+    }
+}
+
+const CHUNK_BYTES: u64 = 32 << 20;
+
+/// The most bytes of chunks (`VICTORY_STAGING_ARENA_MB`, 1536; 0: no arena,
+/// each staging buffer its own, as before), and those kept when empty.
+fn arena_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_ARENA_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1536) << 20
+    })
+}
+
+fn arena_kept() -> u64 {
+    arena_most() / 3
+}
+
+/// Since the start: pieces carved, chunks made, and askings turned away (too
+/// large, or no room).
+pub(crate) static CARVED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `bytes` of an upload buffer shared with others: the buffer, where its
+/// mapping starts, where the piece starts in it (a multiple of 512, which is
+/// what the host asks of a texture's copy source), and the piece, which is
+/// free again once whoever holds it lets go. Zeros, as a buffer made anew.
+fn carve(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource, *mut u8, u64, Piece)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if arena_most() == 0 || bytes > CHUNK_BYTES / 2 {
+        CARVED[2].fetch_add(1, Relaxed);
+        return None;
+    }
+    // (Whole 64 KiB: fewer and larger free ranges.)
+    let size = bytes.max(1).next_multiple_of(64 << 10);
+    let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
+    let Arena { chunks, next, last } = &mut *arena;
+    let count = chunks.len();
+    let mut found = None;
+    for step in 0..count {
+        let i = (*last + step) % count;
+        let c = &mut chunks[i];
+        if c.largest < size {
+            continue;
+        }
+        if let Some(at) = crate::placement::take(&mut c.free, size, 512) {
+            found = Some((i, at));
+            break;
+        }
+        c.largest = c.free.values().copied().max().unwrap_or(0);
+    }
+    if found.is_none() {
+        if (count as u64 + 1) * CHUNK_BYTES > arena_most() {
+            CARVED[2].fetch_add(1, Relaxed);
+            return None;
+        }
+        let (buffer, data) = host.upload_buffer(CHUNK_BYTES)?;
+        CARVED[1].fetch_add(1, Relaxed);
+        let mut free = std::collections::BTreeMap::from([(0, CHUNK_BYTES)]);
+        let at = crate::placement::take(&mut free, size, 512)?;
+        chunks.push(Chunk { buffer, data: data as usize, id: *next, free, largest: CHUNK_BYTES });
+        *next += 1;
+        found = Some((count, at));
+    }
+    let (i, at) = found?;
+    *last = i;
+    let c = &chunks[i];
+    let (buffer, data, piece) = (c.buffer.clone(), c.data as *mut u8, Piece { chunk: c.id, at, size });
+    drop(arena);
+    CARVED[0].fetch_add(1, Relaxed);
+    // SAFETY: the piece is nobody else's.
+    unsafe { std::ptr::write_bytes(data.add(at as usize), 0, bytes as usize) };
+    Some((buffer, data, at, piece))
+}
+
+thread_local! {
+    /// The staging state made here is let go as soon as its upload is recorded
+    /// ([`carve`]).
+    static TRANSIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, staging state this thread makes is carved from shared
+/// buffers.
+pub(crate) struct Transient(bool);
+
+pub(crate) fn transient() -> Transient {
+    Transient(TRANSIENT.replace(true))
+}
+
+impl Drop for Transient {
+    fn drop(&mut self) {
+        TRANSIENT.set(self.0);
+    }
+}
+
+/// The content of a texture's memory, to know it by: a fingerprint
+/// ([`mix`]) or, with `VICTORY_FAST_HASH=0`, BLAKE3 as before (3 GB/s or so,
+/// 69 to 90 ms a frame while the cutscene streams, where detiling the same
+/// bytes took 24 to 33).
+fn content_hash(bytes: &[u8]) -> [u64; 4] {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FAST.get_or_init(|| std::env::var_os("VICTORY_FAST_HASH").is_none_or(|v| v != "0")) {
+        let lanes = mix(bytes);
+        let fold = |seed: u64| lanes.iter().zip([0x9e37_79b9_7f4a_7c15u64, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x85eb_ca77_c2b2_ae63]).fold(seed, |h, (l, k)| (h ^ l).wrapping_mul(k) ^ (h >> 29));
+        return [fold(1), fold(0x1234_5678_9abc_def1), bytes.len() as u64, 1];
+    }
+    let mut out = [0u64; 4];
+    for (o, word) in out.iter_mut().zip(blake3::hash(bytes).as_bytes().chunks_exact(8)) {
+        *o = u64::from_le_bytes(word.try_into().unwrap_or_default());
+    }
+    out
+}
+
+/// Four lanes over the bytes of `read`, 32 at a time.
+fn mix(read: &[u8]) -> [u64; 4] {
+    const K: [u64; 4] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x85eb_ca77_c2b2_ae63];
+    let mut lanes = [read.len() as u64 ^ K[0], K[1], K[2], K[3]];
+    let mut blocks = read.chunks_exact(32);
+    for block in &mut blocks {
+        for (lane, (word, k)) in lanes.iter_mut().zip(block.chunks_exact(8).zip(K)) {
+            let w = u64::from_le_bytes(word.try_into().unwrap_or_default());
+            *lane = (*lane ^ w).wrapping_mul(k).rotate_left(29);
+        }
+    }
+    for &b in blocks.remainder() {
+        lanes[0] = (lanes[0] ^ u64::from(b)).wrapping_mul(K[0]).rotate_left(29);
+    }
+    lanes
+}
+
+/// The most bytes [`POOL`] keeps (`VICTORY_STAGING_POOL_MB`, 128; 0: none,
 /// as before).
 fn pool_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(128) << 20
     })
 }
 
@@ -713,17 +900,7 @@ pub(crate) fn digest(at: *const u8, len: usize) -> u64 {
     with_read(len, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), at, len, false);
         const K: [u64; 4] = [0x9e37_79b9_7f4a_7c15, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x85eb_ca77_c2b2_ae63];
-        let mut lanes = [len as u64 ^ K[0], K[1], K[2], K[3]];
-        let mut blocks = read.chunks_exact(32);
-        for block in &mut blocks {
-            for (lane, (word, k)) in lanes.iter_mut().zip(block.chunks_exact(8).zip(K)) {
-                let w = u64::from_le_bytes(word.try_into().unwrap_or_default());
-                *lane = (*lane ^ w).wrapping_mul(k).rotate_left(29);
-            }
-        }
-        for &b in blocks.remainder() {
-            lanes[0] = (lanes[0] ^ u64::from(b)).wrapping_mul(K[0]).rotate_left(29);
-        }
+        let lanes = mix(read);
         let h = lanes.iter().zip(K).fold(0u64, |h, (lane, k)| (h ^ lane).wrapping_mul(k) ^ (h >> 31));
         (h ^ (h >> 29)).max(1)
     })
@@ -734,6 +911,33 @@ pub(crate) fn digest(at: *const u8, len: usize) -> u64 {
 pub(crate) fn picked_digest(resource: usize, mapped: u64) -> u64 {
     let picked = PICKED.lock().unwrap_or_else(|e| e.into_inner());
     picked.as_ref().and_then(|map| map.get(&resource)).map_or(0, |&(_, there, digest)| if there == mapped { digest } else { 0 })
+}
+
+/// Textures picked by index that were about to be uploaded again, by what
+/// they held when that was looked at last and how many looks it has taken
+/// ([`settled`]).
+static CHANGING: Mutex<Option<HashMap<usize, (u64, u32)>>> = Mutex::new(None);
+
+/// Whether a texture that is to be uploaded again, with the contents `digest`,
+/// has held them since the look before: its memory is mapped before the bytes
+/// arrive, and was uploaded as it changed, over and over
+/// (`VICTORY_PICK_SETTLE=0`: at once, as before). At most some looks are
+/// waited for.
+pub(crate) fn settled(resource: usize, digest: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PICK_SETTLE").is_none_or(|v| v != "0")) {
+        return true;
+    }
+    const MOST: u32 = 6;
+    let mut changing = CHANGING.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = changing.get_or_insert_with(HashMap::new).entry(resource).or_insert((0, 0));
+    let (before, looks) = *entry;
+    if before == digest || looks >= MOST {
+        changing.as_mut().and_then(|map| map.remove(&resource));
+        return true;
+    }
+    *entry = (digest, looks + 1);
+    false
 }
 
 /// `resource` holds what it held when it was last uploaded: as if uploaded in
@@ -1013,7 +1217,7 @@ impl Staging {
                 }
                 let hash = {
                     let _part = crate::host::PartTime::new(11);
-                    blake3::hash(read)
+                    content_hash(read)
                 };
                 if !last.rehash(hash) {
                     return false;
@@ -1035,7 +1239,7 @@ impl Staging {
             return with_title(self.memory, size, |tiled| {
                 let hash = {
                     let _part = crate::host::PartTime::new(11);
-                    blake3::hash(tiled)
+                    content_hash(tiled)
                 };
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1053,7 +1257,7 @@ impl Staging {
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = {
             let _part = crate::host::PartTime::new(11);
-            blake3::hash(tiled)
+            content_hash(tiled)
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1078,7 +1282,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            if last.rehash(blake3::hash(read)) {
+            if last.rehash(content_hash(read)) {
                 self.detile(read);
             }
             true
@@ -1321,6 +1525,7 @@ pub(crate) fn make_staging(resource: This, texture: &ID3D12Resource) -> Option<(
     if host_written || !title_written(texture) {
         return None;
     }
+    let _transient = transient();
     staged_or_made(resource, texture)
 }
 
@@ -1371,7 +1576,17 @@ fn staged_or_made(resource: This, texture: &ID3D12Resource) -> Option<(Arc<Stagi
             Some(&mut total),
         );
     }
-    let (buffer, data) = take_staging(host, total)?;
+    let piece = if TRANSIENT.get() { carve(host, total) } else { None };
+    let (buffer, data, base, chunk) = match piece {
+        Some((buffer, data, base, chunk)) => (buffer, data, base, Some(chunk)),
+        None => {
+            let (buffer, data) = take_staging(host, total)?;
+            (buffer, data, 0, None)
+        }
+    };
+    for footprint in &mut footprints {
+        footprint.Offset += base;
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1383,6 +1598,7 @@ fn staged_or_made(resource: This, texture: &ID3D12Resource) -> Option<(Arc<Stagi
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        chunk,
         #[cfg(feature = "diagnostics")]
         size: total,
         data,

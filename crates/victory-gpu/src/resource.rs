@@ -1379,7 +1379,8 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        // (Space of texture heaps that is free is not in use.)
+        Some([budget, used, ..]) => used.saturating_sub(crate::placement::free_bytes()) < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1617,7 +1618,11 @@ pub(crate) fn let_go_lately(named: &str) -> String {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        let _part = crate::host::PartTime::new(14);
         crate::host::texture_let_go(&self.texture);
+        if let Some(placement) = crate::placement::taken(&self.texture) {
+            crate::placement::free(self.texture.clone(), placement);
+        }
         #[cfg(feature = "diagnostics")]
         if crate::host::dred_on() {
             use windows::core::Interface;
@@ -1752,6 +1757,41 @@ fn host_texture(
     };
     let mut texture: Option<ID3D12Resource> = None;
     let took = crate::host::PartTime::new(6);
+    // In a heap of textures if it fits there (`crate::placement`).
+    // SAFETY: the description has the host layout (checked size, same fields).
+    let plain = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    if clear_value.is_none()
+        && crate::placement::on()
+        && crate::placement::fits(&host.device, &plain)
+        && let Some((heap, placement)) = crate::placement::place(&host.device, &plain)
+    {
+        // SAFETY: a range of the heap that is nobody's; the out pointer is ours.
+        let made = unsafe {
+            host.device.CreatePlacedResource(
+                &heap,
+                placement.offset(),
+                &plain,
+                D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                None,
+                &mut texture,
+            )
+        };
+        match (made, &texture) {
+            (Ok(()), Some(t)) => {
+                crate::placement::note(t, placement);
+                drop(took);
+                crate::host::name(t, || {
+                    use windows::core::Interface;
+                    format!("texture {}x{} f{} flags {:#x} at {:p} placed", d.width, d.height, d.format, d.flags, t.as_raw())
+                });
+                return texture;
+            }
+            _ => {
+                crate::placement::unplace(placement);
+                texture = None;
+            }
+        }
+    }
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
     let made = unsafe {

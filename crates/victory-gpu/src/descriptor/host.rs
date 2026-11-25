@@ -1150,6 +1150,11 @@ impl HostHeap {
         tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
     }
 
+    /// Whether title slot `index` was a table's lately ([`HostHeap::tabled`]).
+    pub(crate) fn tabled_slot(&self, index: u32, frame: u64) -> bool {
+        self.tabled_lately(index, frame)
+    }
+
     /// What `tabled` holds for title slot `index`; 0: never a table's.
     fn tabled_stamp(&self, index: u32) -> u32 {
         self.tabled
@@ -1564,7 +1569,9 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        let waited = for_draw.then(|| crate::host::PartTime::new(13));
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        drop(waited);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1616,6 +1623,7 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
+                let _part = crate::host::PartTime::new(15);
                 make(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
