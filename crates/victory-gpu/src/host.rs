@@ -1835,7 +1835,18 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// The waits for shader writes and the dispatches recorded, and how many
+    /// there were at the last clamp of indirect arguments (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    syncs: (u64, u64),
 }
+
+/// Since the last frame line (diagnostics), of the clamps of indirect
+/// arguments: all, those whose arguments no shader of the list was declared
+/// to write before, those whose arguments no shader was expected to write,
+/// and runs of them with no wait for shader writes and no dispatch between.
+#[cfg(feature = "diagnostics")]
+pub(crate) static CLAMPS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 impl Deferred {
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
@@ -5512,6 +5523,41 @@ impl HostList {
         Some(buffer)
     }
 
+    /// A wait for shader writes or a dispatch is recorded (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_sync(&self) {
+        self.deferred().syncs.0 += 1;
+    }
+
+    /// A clamp of the arguments `[address, address + len)` is recorded
+    /// (diagnostics: [`CLAMPS`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_clamp(&self, args: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
+        let (from, to) = (address as usize, (address + len) as usize);
+        let mut deferred = self.deferred();
+        let (mut declared, mut expected) = (false, false);
+        for step in &deferred.copies {
+            if let Step::GpuWrite(shadow, at, n) = step
+                && std::sync::Arc::ptr_eq(shadow, args)
+                && *at < to
+                && at + n > from
+            {
+                declared = true;
+                expected |= shadow.expected_writes((*at, at + n)).iter().any(|&(a, b)| a < to && b > from);
+                if expected {
+                    break;
+                }
+            }
+        }
+        let now = deferred.syncs.0 + 1;
+        let new_run = deferred.syncs.1 != now;
+        deferred.syncs.1 = now;
+        drop(deferred);
+        for (i, on) in [true, !declared, !expected, new_run].into_iter().enumerate() {
+            CLAMPS[i].fetch_add(u64::from(on), Ordering::Relaxed);
+        }
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -6327,6 +6373,14 @@ impl Meter {
             );
             log_joined(frames);
             log_card_timing(frames);
+            let c = CLAMPS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "clamps of indirect arguments per frame: {:.0}; {:.0} of arguments no shader of the list was declared to write before, {:.0}                  no shader was expected to write; {:.0} runs with no wait or dispatch between",
+                c[0],
+                c[1],
+                c[2],
+                c[3]
+            );
             crate::ahead::log(frames);
             let r = crate::list::RECYCLE.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
