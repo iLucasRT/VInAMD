@@ -5688,6 +5688,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
+        // Not if the ranges meet: the copy at their own addresses knows.
+        let apart = (src as usize) >= (dst as usize) + len || (dst as usize) >= (src as usize) + len;
+        if apart && crate::watch::put(dst as usize, len, |at| crate::usercopy::copy(src, at, len) == Some(true)) {
+            return;
+        }
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
@@ -5814,6 +5819,16 @@ unsafe extern "system" {
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// [`write_mapped`], with the guards: behind them if it can be
+/// (`crate::watch::put`), else they are opened for it.
+pub(crate) fn put_mapped(dst: usize, src: *const u8, len: usize) {
+    if crate::watch::put(dst, len, |at| crate::usercopy::copy(src, at, len) == Some(true)) {
+        return;
+    }
+    crate::watch::writing(dst, len);
+    write_mapped(dst as *mut u8, src, len);
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -6126,6 +6141,12 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             crate::watch::log_guard_parts(frames);
+            let [behind, not] = [0, 1].map(|i| crate::watch::PUTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [spared, wrong] = [0, 1].map(|i| crate::shadow::STAMPED_CLEAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "writes behind the guards per frame: {behind:.0}, {not:.0} not (VICTORY_WRITE_BEHIND); refreshes spared by stamps: {spared:.0}, \
+                 of them found wrong {wrong:.2} (VICTORY_CLEAN_STAMPS=check counts)"
+            );
             log_joined(frames);
             let r = crate::list::RECYCLE.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(

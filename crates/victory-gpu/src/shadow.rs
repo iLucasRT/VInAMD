@@ -43,6 +43,9 @@ pub(crate) struct Shadow {
     /// Where shaders that declare all of the copy written were found to
     /// write it ([`Shadow::expected_writes`]).
     wide: Mutex<WideWrites>,
+    /// Ranges that were brought up to date and wholly clean, with the
+    /// stamps they had then (`crate::watch::stamp`).
+    clean: Mutex<std::collections::HashMap<(usize, usize), u64>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -101,6 +104,11 @@ const WIDE_FRAMES: u64 = 90;
 
 /// Pieces found written after [`WIDE_FRAMES`], which were not expected.
 pub(crate) static WIDE_SURPRISES: AtomicU64 = AtomicU64::new(0);
+
+/// Since the last frame line: refreshes spared by stamps
+/// (`crate::watch::stamp`), and of those asked about all the same, the ones
+/// the guards had something for.
+pub(crate) static STAMPED_CLEAN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Since the last frame line: bytes of pages the title wrote that were
 /// looked through for what changed, and those that had.
@@ -1152,7 +1160,9 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        // `VICTORY_WIDE_THREADS`: how many (a quarter of the processor's).
+        let asked = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.parse::<usize>().ok());
+        let n = asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4)).clamp(2, if asked.is_some() { 16 } else { 6 });
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1921,6 +1931,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             wide: Mutex::default(),
+            clean: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -2232,8 +2243,7 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    crate::host::put_mapped(start + at, title.as_ptr(), n);
                     written += n;
                 }
             }
@@ -2321,8 +2331,7 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::put_mapped(start + at, title.as_ptr(), n);
         n
     }
 
@@ -2730,9 +2739,38 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // Wholly clean when last brought up to date, and the same stamps
+            // since: nothing to take. (Read before the guards are asked, so
+            // that a write in between shows.)
+            let stamp = crate::watch::stamp(from, to);
+            let same = stamp.is_some() && {
+                let clean = self.clean.lock().unwrap_or_else(|e| e.into_inner());
+                clean.get(&(from, to)).copied() == stamp
+            };
+            if same {
+                STAMPED_CLEAN[0].fetch_add(1, Ordering::Relaxed);
+                if crate::watch::clean_stamps() == 1 {
+                    return 0;
+                }
+            }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
+                let whole = crate::watch::wholly_clean();
+                if same && !whole && crate::watch::stamp(from, to) == stamp {
+                    STAMPED_CLEAN[1].fetch_add(1, Ordering::Relaxed);
+                }
                 let copied = self.copy_stale(from, to, now, &written);
+                if let Some(stamp) = stamp {
+                    let mut clean = self.clean.lock().unwrap_or_else(|e| e.into_inner());
+                    if whole {
+                        if clean.len() >= 256 {
+                            clean.clear();
+                        }
+                        clean.insert((from, to), stamp);
+                    } else {
+                        clean.remove(&(from, to));
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2943,8 +2981,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                crate::host::put_mapped(start + at, title.as_ptr(), n);
                 written = n;
             }
         } else {
@@ -3037,8 +3074,7 @@ impl Shadow {
                 found.push((self.start, at, n));
             }
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::put_mapped(start + at, title.as_ptr(), n);
         n
     }
 }

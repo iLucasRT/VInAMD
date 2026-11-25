@@ -64,5 +64,5 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    set_alias_lookup, title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    set_alias_lookup, set_behind, writes_behind, title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
 };

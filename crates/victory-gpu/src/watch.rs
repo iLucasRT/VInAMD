@@ -304,6 +304,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    WHOLLY_CLEAN.set(false);
     // View memory, known by a guard of ours: not the kernel's to answer.
     // (The guards are taken once for the whole answer. Every refreshing
     // thread wants them at once, and three times for an answer was 22% of
@@ -663,6 +664,7 @@ fn guard(
         part(2, u64::from(unclean.is_empty()));
         part(13, unclean.len() as u64);
     }
+    WHOLLY_CLEAN.set(unclean.is_empty());
     if unclean.is_empty() {
         // Nothing written, mapped or new since the range was last taken.
         return Some((written, g));
@@ -839,6 +841,129 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
+/// The runtime's way to write title view memory through a view of its own:
+/// calls its last argument with where `[at, at + len)` shows there.
+type Behind = fn(usize, usize, &mut dyn FnMut(*mut u8) -> bool) -> Option<bool>;
+
+static BEHIND: std::sync::OnceLock<Behind> = std::sync::OnceLock::new();
+
+pub fn set_behind(behind: Behind) {
+    let _ = BEHIND.set(behind);
+}
+
+/// Whether what we write into title view memory goes through views of our
+/// own, beside the guards (`VICTORY_WRITE_BEHIND=1`).
+///
+/// A guarded block was opened for such a write, with every view of its
+/// pages, and protected again at the next refresh: 6,600 blocks opened and
+/// 6,400 protected a frame, 30 ms of all threads with the guards' lock
+/// held, nearly all of it for what shaders wrote coming back and the
+/// title's copies made at submission. Behind the guards the blocks stay
+/// read-only and only count as written.
+pub fn writes_behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_BEHIND").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line (diagnostics): writes behind the guards, and
+/// those that could not be made there.
+#[cfg(feature = "diagnostics")]
+pub(crate) static PUTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Writes title memory `[at, at + len)` behind the guards: `write` is
+/// called with where to. False if it has to be written at its own address
+/// ([`writing`] first; some of it may have been written).
+///
+/// The blocks count as written after the write, not before: a copy that
+/// took a block in between would have found it clean with the old bytes,
+/// and nothing faults to say so afterwards.
+pub(crate) fn put(at: usize, len: usize, mut write: impl FnMut(*mut u8) -> bool) -> bool {
+    if !writes_behind() || len == 0 {
+        return false;
+    }
+    let done = BEHIND.get().and_then(|&behind| put_with(behind, at, len, &mut write));
+    #[cfg(feature = "diagnostics")]
+    PUTS[usize::from(done != Some(true))].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    done == Some(true)
+}
+
+/// [`put`] by `behind`: as that, and the blocks count as written.
+fn put_with(behind: Behind, at: usize, len: usize, write: &mut dyn FnMut(*mut u8) -> bool) -> Option<bool> {
+    let done = behind(at, len, write);
+    if done.is_some() {
+        let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        let mut g = guards();
+        for block in g.clean.range(first, last) {
+            g.unclean(block);
+        }
+        let mut others = Vec::new();
+        for block in g.aliased.range(first, last) {
+            aliases_of(block, &mut others);
+            for &other in &others {
+                g.unclean(other);
+            }
+        }
+        drop(g);
+        crate::descriptor::host::remapped(at, len);
+    }
+    done
+}
+
+/// A number per 16 MiB of addresses below 256 GiB, which rises whenever a
+/// clean block there stops being clean ([`Guards::unclean`]).
+static STAMPS: [std::sync::atomic::AtomicU64; 1 << 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 1 << 14];
+const STAMPED: usize = 16 << 20;
+
+/// The sum of the stamps of `[start, end)`: while it stays the same, blocks
+/// that were clean are. `None` past what is stamped, or switched off
+/// (`VICTORY_CLEAN_STAMPS=1` is on, `check` asks all the same and counts).
+pub(crate) fn stamp(start: usize, end: usize) -> Option<u64> {
+    if clean_stamps() == 0 || start >= end || (end - 1) / STAMPED >= STAMPS.len() {
+        return None;
+    }
+    Some(
+        (start / STAMPED..=(end - 1) / STAMPED)
+            .fold(0u64, |sum, i| sum.wrapping_add(STAMPS[i].load(std::sync::atomic::Ordering::Acquire))),
+    )
+}
+
+/// 0: no stamps. 1: a range of view memory that was wholly clean when last
+/// asked about, and whose stamps are the same, is not asked about again.
+/// 2: asked about all the same; what the stamps got wrong is counted.
+///
+/// Some 740 of a frame's 1,650 answers of the guards are for wholly clean
+/// ranges, each behind the guards' lock.
+pub(crate) fn clean_stamps() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_CLEAN_STAMPS").as_deref() {
+        Ok("1") => 1,
+        Ok("check") => 2,
+        _ => 0,
+    })
+}
+
+thread_local! {
+    /// Whether this thread's last [`writes`] found the range wholly clean,
+    /// by the guards.
+    static WHOLLY_CLEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`WHOLLY_CLEAN`].
+pub(crate) fn wholly_clean() -> bool {
+    WHOLLY_CLEAN.get()
+}
+
+impl Guards {
+    /// `block` is not clean any more: a copy must take it.
+    fn unclean(&mut self, block: usize) {
+        if self.clean.remove(block)
+            && let Some(stamp) = STAMPS.get(block / (STAMPED / BLOCK))
+        {
+            stamp.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
@@ -849,7 +974,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let blocks = g.protected.range(first, last);
     let mut guarded = Vec::new();
     let mut unguard = |g: &mut Guards, block: usize| {
-        g.clean.remove(block);
+        g.unclean(block);
         if g.protected.remove(block) {
             guarded.push(block);
         }
@@ -1120,7 +1245,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     for block in g.protected.range(range.start, range.end) {
         g.protected.remove(block);
-        g.clean.remove(block);
+        g.unclean(block);
     }
     for block in g.aliased.range(range.start, range.end) {
         g.aliased.remove(block);
@@ -1586,7 +1711,7 @@ mod tests {
             }
         }
         // SAFETY: one pagefile section of a block, mapped twice read-write.
-        let (a, b) = unsafe {
+        let (a, b, c) = unsafe {
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -1597,6 +1722,7 @@ mod tests {
             );
             assert!(!section.is_null());
             (
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
                 MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
                 MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
             )
@@ -1619,6 +1745,35 @@ mod tests {
         assert_eq!(guard(b, b + BLOCK, None).map(|(w, _)| w), Some(vec![]));
         writing(a + 16, 4);
         assert_eq!(guard(b, b + BLOCK, None).map(|(w, _)| w), Some(vec![b / PAGE]));
+        // A write behind the guards, through a third view: both count as
+        // written, and both stay read-only (the next write faults).
+        assert_eq!(guard(a, a + BLOCK, None).map(|(w, _)| w), Some(vec![a / PAGE]));
+        assert_eq!(guard(b, b + BLOCK, None).map(|(w, _)| w), Some(vec![]));
+        static C: AtomicUsize = AtomicUsize::new(0);
+        fn behind(at: usize, len: usize, write: &mut dyn FnMut(*mut u8) -> bool) -> Option<bool> {
+            let a = A.load(Ordering::Relaxed);
+            (at >= a && at + len <= a + BLOCK).then(|| write((C.load(Ordering::Relaxed) + at - a) as *mut u8))
+        }
+        C.store(c, Ordering::Relaxed);
+        let mut store = |to: *mut u8| {
+            // SAFETY: the third view, read-write.
+            unsafe { to.write_volatile(42) };
+            true
+        };
+        assert_eq!(put_with(behind, a + 100, 1, &mut store), Some(true));
+        // SAFETY: the same byte through the first view.
+        assert_eq!(unsafe { ((a + 100) as *const u8).read_volatile() }, 42);
+        {
+            let g = guards();
+            assert!(g.protected.contains(a / BLOCK) && g.protected.contains(b / BLOCK));
+        }
+        assert_eq!(guard(a, a + BLOCK, None).map(|(w, _)| w), Some(vec![a / PAGE]));
+        assert_eq!(guard(b, b + BLOCK, None).map(|(w, _)| w), Some(vec![b / PAGE]));
+        assert_eq!(guard(a, a + BLOCK, None).map(|(w, _)| w), Some(vec![]));
+        assert_eq!(put_with(behind, b, 1, &mut store), None, "not shown there");
+        // SAFETY: our view; the guard's handler opens it.
+        unsafe { ((b + 8) as *mut u8).write_volatile(9) };
+        assert_eq!(guard(a, a + BLOCK, None).map(|(w, _)| w), Some(vec![a / PAGE]));
         A.store(0, Ordering::Relaxed);
         B.store(0, Ordering::Relaxed);
         for v in [a, b] {

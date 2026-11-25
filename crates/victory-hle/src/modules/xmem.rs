@@ -342,7 +342,25 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    size: usize,
+    /// A read-write view of our own on all of it, which nothing guards;
+    /// made when first asked for, 0 if the host refused.
+    behind: std::sync::OnceLock<usize>,
+}
+
+impl Section {
+    /// The address of our own view ([`Section::behind`]), if there is one.
+    fn behind(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a section of ours, whole; the view lasts as long as it.
+        let at = *self
+            .behind
+            .get_or_init(|| unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.size).Value as usize });
+        (at != 0).then_some(at)
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -351,8 +369,17 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        // SAFETY: our own view (nothing shows at its addresses any more,
+        // `note_aliases`) and our handle; the title's views keep the section
+        // alive on their own.
+        unsafe {
+            if let Some(&at) = self.behind.get()
+                && at != 0
+            {
+                windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void });
+            }
+            CloseHandle(self.handle)
+        };
     }
 }
 
@@ -409,6 +436,7 @@ fn aliases() -> MutexGuard<'static, Aliases> {
 /// (`shown`), or as no longer showing them.
 fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) {
     let section = Arc::as_ptr(&slice.section) as usize;
+    note_behind(base, len, slice, shown);
     let mut a = aliases();
     for k in 0..len / PAGE {
         let (at, key) = (base + k * PAGE, (section, slice.index + k));
@@ -429,6 +457,46 @@ fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) {
             }
         }
     }
+}
+
+/// By title page address: where our own view shows the same page
+/// ([`Section::behind`]). Held shared while something is written there.
+static BEHIND: LazyLock<std::sync::RwLock<HashMap<usize, usize>>> = LazyLock::new(std::sync::RwLock::default);
+
+/// As `note_aliases`, for [`BEHIND`].
+fn note_behind(base: usize, len: usize, slice: &Slice, shown: bool) {
+    if victory_gpu::writes_behind() {
+        show_behind(base, len, slice, shown);
+    }
+}
+
+fn show_behind(base: usize, len: usize, slice: &Slice, shown: bool) {
+    let at = if shown { slice.section.behind() } else { None };
+    let mut behind = BEHIND.write().unwrap_or_else(|e| e.into_inner());
+    for k in 0..len / PAGE {
+        match at {
+            Some(at) => behind.insert(base + k * PAGE, at + (slice.index + k) * PAGE),
+            None => behind.remove(&(base + k * PAGE)),
+        };
+    }
+}
+
+/// Calls `write` with where our own views show title view memory
+/// `[at, at + len)`, if they show all of it in one piece: what it returns;
+/// `None` if not. The pages may not be committed (`victory_gpu`'s writes
+/// behind the guards).
+fn behind(at: usize, len: usize, write: &mut dyn FnMut(*mut u8) -> bool) -> Option<bool> {
+    let behind = BEHIND.read().unwrap_or_else(|e| e.into_inner());
+    let first = at - at % PAGE;
+    let start = *behind.get(&first)?;
+    let mut page = first + PAGE;
+    while page < at + len {
+        if *behind.get(&page)? != start + (page - first) {
+            return None;
+        }
+        page += PAGE;
+    }
+    Some(write((start + (at - first)) as *mut u8))
 }
 
 /// The other addresses showing the physical page mapped at page address
@@ -490,7 +558,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section { handle, size, behind: std::sync::OnceLock::new() });
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -540,7 +608,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -810,7 +878,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -838,9 +906,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     static LOOKUP: std::sync::Once = std::sync::Once::new();
-    LOOKUP.call_once(|| victory_gpu::set_alias_lookup(other_views));
+    LOOKUP.call_once(|| {
+        victory_gpu::set_alias_lookup(other_views);
+        victory_gpu::set_behind(behind);
+    });
     note_aliases(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
@@ -1228,6 +1299,30 @@ mod tests {
             assert_eq!(at(b, 1).cast::<u8>().read(), 7);
             a.cast::<u8>().write(1);
         }
+        // Our own view of the section shows the same pages, in one piece
+        // where the title's view does; nothing elsewhere.
+        let slice = physical().views.get(&(a as usize)).expect("mapped").1.clone();
+        show_behind(a as usize, 3 * PAGE, &slice, true);
+        let mut seen = Vec::new();
+        let mut look = |to: *mut u8| {
+            seen.push(to as usize);
+            // SAFETY: committed pages of our own view.
+            unsafe { to.write(5) };
+            true
+        };
+        assert_eq!(behind(a as usize + 2 * PAGE + 3, 1, &mut look), Some(true));
+        assert_eq!(behind(a as usize + PAGE - 1, PAGE + 2, &mut look), Some(true));
+        assert_eq!(behind(a as usize + 2 * PAGE, PAGE + 1, &mut look), None);
+        assert_eq!(behind(b as usize, 1, &mut look), None);
+        // SAFETY: mapped read-write.
+        unsafe {
+            assert_eq!(at(a, 2).cast::<u8>().add(3).read(), 5);
+            assert_eq!(a.cast::<u8>().add(PAGE - 1).read(), 5);
+        }
+        assert!(seen.iter().all(|&to| to != 0 && !(a as usize..a as usize + 3 * PAGE).contains(&to)));
+        show_behind(a as usize, 3 * PAGE, &slice, false);
+        assert_eq!(behind(a as usize, 1, &mut |_| true), None);
+        drop(slice);
         // Writes into pages (DirectStorage's) show through their views.
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
