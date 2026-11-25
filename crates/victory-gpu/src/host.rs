@@ -39,6 +39,11 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
+    /// Dedicated DMA copy queue (`D3D12_COMMAND_LIST_TYPE_COPY`) for
+    /// [`Host::relay_card_back`], so readbacks of completed flights do not
+    /// queue behind in-flight graphics work on `queue` (`VICTORY_RELAY_COPY_QUEUE=0`
+    /// disables it).
+    copy_queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -615,6 +620,16 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
+        let copy_queue = if std::env::var_os("VICTORY_RELAY_COPY_QUEUE").is_some_and(|v| v == "0") {
+            None
+        } else {
+            device
+                .CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })
+                .ok()
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -638,6 +653,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             queue,
+            copy_queue,
             fence,
             submitted: Mutex::new(0),
             event,
@@ -1578,6 +1594,10 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// Value of [`QUEUE_ORDER`] immediately after this submission's `sync`
+    /// list was queued on `Host::queue`. Every send `<= order_after` has
+    /// finished on the card once this flight completes.
+    order_after: u64,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2382,6 +2402,9 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    /// True when `list` was created as `D3D12_COMMAND_LIST_TYPE_COPY` for
+    /// `Host::copy_queue`.
+    copy_queue: bool,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -3195,8 +3218,10 @@ impl Host {
             }
             used.push((false, sync));
         }
+        let order_after = order.as_deref().copied().unwrap_or(0);
         drop(order);
         let mut plan = CardPlan {
+            order_after,
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
@@ -3316,14 +3341,37 @@ impl Host {
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
+    /// Prefers a `D3D12_COMMAND_LIST_TYPE_COPY` list when `self.copy_queue`
+    /// is available so readbacks run on the hardware DMA engine without
+    /// waiting behind in-flight graphics work on `self.queue`.
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        let (list, copy_queue) = if self.copy_queue.is_some() {
+            // SAFETY: plain object creation.
+            let copy_list: windows::core::Result<Prelude> = unsafe {
+                (|| {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device
+                            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                })()
+            };
+            match copy_list {
+                Ok(prelude) => (prelude, true),
+                Err(_) => (self.make_prelude()?, false),
+            }
+        } else {
+            (self.make_prelude()?, false)
+        };
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
+                copy_queue,
                 fence,
                 event,
                 sent: 0,
@@ -3383,9 +3431,15 @@ impl Host {
                 }
             }
         }
+        let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
         if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            // Nothing to fetch: every send up to these flights is done.
+            let after = if self.copy_queue.is_some() {
+                completed_order
+            } else {
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+            };
+            crate::shadow::relay_fetched(after);
             return;
         }
         if fetch.is_none() {
@@ -3402,7 +3456,8 @@ impl Host {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let ((allocator, list), use_copy_queue, fence, event, sent) =
+            (f.list.clone(), f.copy_queue, f.fence.clone(), f.event, f.sent);
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -3416,17 +3471,29 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
-                Ok(after)
+                if use_copy_queue && let Some(cq) = &self.copy_queue {
+                    // The flights being landed have already completed on
+                    // `self.queue`, so all sends `<= completed_order` are
+                    // visible in VRAM; any later send has `s.2 > completed_order`
+                    // and is skipped by `card_merge_relay`.
+                    cq.ExecuteCommandLists(&lists);
+                    cq.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(completed_order)
+                } else {
+                    // In the order of the queue: the sends of title bytes so
+                    // far are ahead of this fetch, every later one behind it.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent();
+                    self.queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(after)
+                }
             })()
         };
         let after = match ran {
