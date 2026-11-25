@@ -1420,11 +1420,23 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
+    // A part of them each time, in the order of their addresses: looked at
+    // whole, the 67,000 of a streaming world were 3 % of the submitting
+    // thread's time, all of it in one submission a second.
+    const AT_ONCE: usize = 16_384;
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let from = FROM.load(Relaxed);
+    let mut last = None;
+    for &at in all.range(from..).take(AT_ONCE) {
+        last = Some(at);
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        // What is cheap to know first: most were used lately or have none.
+        if !fills(&r.desc)
+            || !crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+            || crate::texture::host_wrote(at)
+        {
             continue;
         }
         let gone = {
@@ -1456,6 +1468,9 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // The next time from here on, or from the start again.
+    let next = last.filter(|&at| all.range(at + 1..).next().is_some()).map_or(0, |at| at + 1);
+    FROM.store(next, Relaxed);
     if went > 0 {
         crate::host::trail(|| {
             format!(
