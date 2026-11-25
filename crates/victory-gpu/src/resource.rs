@@ -1438,6 +1438,7 @@ pub(crate) fn let_go_idle() {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
+                crate::texture::forget_picked(at);
                 made.take()
             } else {
                 None

@@ -555,8 +555,39 @@ pub(crate) fn redo_at_present(frame: u64) {
     tracing::info!(frame, phase, count, "textures uploaded again (VICTORY_REDO_TEXTURES)");
 }
 
+/// Textures shaders pick by index, by the frame the pass over the view heap
+/// last uploaded each in and how much of its memory was mapped then
+/// (`u64::MAX`: all).
+static PICKED: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
+
+/// Whether `resource` was uploaded for a slot shaders pick by index in
+/// frame `written` (`HostHeap::texture_slot_written`) or after it, with as much of its memory there: one texture stands in
+/// many slots, all of them due at once when its memory changes, and each
+/// staged, detiled and uploaded the whole of it again.
+pub(crate) fn picked_since(resource: usize, written: u64, mapped: u64) -> bool {
+    let picked = PICKED.lock().unwrap_or_else(|e| e.into_inner());
+    picked
+        .as_ref()
+        .and_then(|map| map.get(&resource))
+        .is_some_and(|&(frame, there)| frame >= written && there == mapped)
+}
+
+/// `resource` was uploaded in `frame`, with `mapped` bytes of it there.
+pub(crate) fn note_picked(resource: usize, frame: u64, mapped: u64) {
+    let mut picked = PICKED.lock().unwrap_or_else(|e| e.into_inner());
+    picked.get_or_insert_with(HashMap::new).insert(resource, (frame, mapped));
+}
+
+/// The host copy of `resource` goes.
+pub(crate) fn forget_picked(resource: usize) {
+    if let Some(map) = PICKED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&resource);
+    }
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
+    forget_picked(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);

@@ -339,6 +339,8 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
+/// Slots whose texture another slot had uploaded since.
+pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
@@ -1606,6 +1608,18 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            // Another slot of the same texture had it uploaded since.
+            let there = partly.unwrap_or(u64::MAX);
+            if !tabled
+                && placed.is_some()
+                && host
+                    .texture_slot_written(index, write)
+                    .is_some_and(|written| crate::texture::picked_since(resource as usize, written, there))
+            {
+                HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
+                host.texture_slot_done(index, write, partly.map(|mapped| (frame + 1, mapped)));
+                continue;
+            }
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
@@ -1647,6 +1661,7 @@ impl State {
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
             crate::texture::unstage(resource);
+            crate::texture::note_picked(resource as usize, frame, there);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

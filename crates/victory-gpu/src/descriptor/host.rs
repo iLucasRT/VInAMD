@@ -424,7 +424,9 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let behind = self.slots.get(&index).is_some_and(|w| w.behind);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, behind });
+        // The write itself may land after this: what is uploaded from
+        // the next frame on has it.
+        self.slots.insert(index, Waiting { due, written: frame + 1, write, looks: 0, mapped: 0, behind });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -863,6 +865,13 @@ impl HostHeap {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
             None => textures.done(index, write),
         }
+    }
+
+    /// The frame in which title slot `index` was written, or the one after
+    /// its texture's memory changed, if it is still the write handed out as `write`.
+    pub(crate) fn texture_slot_written(&self, index: u32, write: u64) -> Option<u64> {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.same(index, write).map(|w| w.written)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
