@@ -148,10 +148,9 @@ impl Spans {
     }
 
     /// Slot `index` holds a view of a texture in `[start, end)`. `newer`:
-    /// the title wrote it now and the slots whose views describe that
-    /// memory otherwise are to be given up: they are returned, and
-    /// forgotten.
-    fn note(&mut self, index: u32, start: u64, end: u64, newer: bool) -> Vec<u32> {
+    /// the title wrote it now; the slots whose views describe that memory
+    /// otherwise are returned, and forgotten if `forget`.
+    fn note(&mut self, index: u32, start: u64, end: u64, newer: bool, forget: bool) -> Vec<u32> {
         if self.by_slot.get(&index) == Some(&(start, end)) {
             return Vec::new();
         }
@@ -166,8 +165,10 @@ impl Spans {
                     stale.extend(slots.iter().copied());
                 }
             }
-            for &slot in &stale {
-                self.forget(slot);
+            if forget {
+                for &slot in &stale {
+                    self.forget(slot);
+                }
             }
         }
         let class = Self::class(end - start);
@@ -301,6 +302,9 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// A view written since describes its memory otherwise: it is served
+    /// after the others (it may well be used no more).
+    behind: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -323,7 +327,14 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, behind: false });
+    }
+
+    /// A newer view describes slot `index`'s memory otherwise.
+    fn behind(&mut self, index: u32) {
+        if let Some(w) = self.slots.get_mut(&index) {
+            w.behind = true;
+        }
     }
 
     fn remove(&mut self, index: u32) {
@@ -339,12 +350,20 @@ impl TextureQueue {
     ///   turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    ///   first 3D frames);
+    /// - last the ones whose memory a newer view describes otherwise.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let mut behind: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.behind {
+                &mut behind
+            } else if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
@@ -361,6 +380,8 @@ impl TextureQueue {
                 order.push((fresh[old].1, fresh[old].2));
             }
         }
+        behind.sort_unstable_by(newest_first);
+        order.extend(behind.iter().map(|&(_, index, write)| (index, write)));
         order.truncate(max);
         order
     }
@@ -402,7 +423,8 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        let behind = self.slots.get(&index).is_some_and(|w| w.behind);
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, behind });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1098,7 +1120,7 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let mut stale = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view
@@ -1107,7 +1129,7 @@ impl HostHeap {
                 Some((start, end)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
-                    placed.note(index, start, end, !seen && stale_out())
+                    placed.note(index, start, end, !seen, stale_out())
                 }
                 None => {
                     placed.forget(index);
@@ -1119,7 +1141,14 @@ impl HostHeap {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
-                textures.remove(slot);
+                if stale_out() {
+                    textures.remove(slot);
+                } else {
+                    textures.behind(slot);
+                }
+            }
+            if !stale_out() {
+                stale.clear();
             }
         }
         let stride = view.and_then(view_stride);
@@ -2443,26 +2472,26 @@ mod tests {
     fn a_newer_view_of_other_memory_makes_the_older_stale() {
         let mut spans = Spans::default();
         // Three textures side by side, the first in two slots.
-        assert!(spans.note(1, 0x1000, 0x3000, true).is_empty());
-        assert!(spans.note(2, 0x1000, 0x3000, true).is_empty());
-        assert!(spans.note(3, 0x3000, 0x4000, true).is_empty());
-        assert!(spans.note(4, 0x8000, 0x9000, true).is_empty());
+        assert!(spans.note(1, 0x1000, 0x3000, true, true).is_empty());
+        assert!(spans.note(2, 0x1000, 0x3000, true, true).is_empty());
+        assert!(spans.note(3, 0x3000, 0x4000, true, true).is_empty());
+        assert!(spans.note(4, 0x8000, 0x9000, true, true).is_empty());
         // The same slot written with the same span again: nothing changes.
-        assert!(spans.note(2, 0x1000, 0x3000, true).is_empty());
+        assert!(spans.note(2, 0x1000, 0x3000, true, true).is_empty());
         assert_eq!(spans.slots_in(0x2000, 0x3800), [3, 1, 2]);
         assert_eq!(spans.slots_in(0x4000, 0x8000), [] as [u32; 0]);
         // The title writes a texture over the end of the first and all of
         // the second: their three slots are stale, if that is asked for.
-        let mut stale = spans.note(5, 0x2000, 0x4000, true);
+        let mut stale = spans.note(5, 0x2000, 0x4000, true, true);
         stale.sort_unstable();
         assert_eq!(stale, [1, 2, 3]);
         assert_eq!(spans.slots_in(0, u64::MAX).len(), 2);
         // Another start in the same memory: stale in turn. Another length
         // from the same start too.
-        assert_eq!(spans.note(6, 0x2800, 0x3000, true), [5]);
-        assert_eq!(spans.note(7, 0x2800, 0x2c00, true), [6]);
+        assert_eq!(spans.note(6, 0x2800, 0x3000, true, true), [5]);
+        assert_eq!(spans.note(7, 0x2800, 0x2c00, true, true), [6]);
         // A slot that moves to another texture leaves its span behind.
-        assert!(spans.note(7, 0x8000, 0x9000, true).is_empty());
+        assert!(spans.note(7, 0x8000, 0x9000, true, true).is_empty());
         assert_eq!(spans.slots_in(0x2800, 0x2c00), [] as [u32; 0]);
         assert_eq!(spans.slots_in(0x8000, 0x8001), [4, 7]);
         spans.forget(4);
@@ -2477,10 +2506,10 @@ mod tests {
         let mut spans = Spans::default();
         // A texture, the same without its largest mips, one inside it, and
         // a long one over everything.
-        assert!(spans.note(1, 0x10000, 0x50000, false).is_empty());
-        assert!(spans.note(2, 0x10000, 0x20000, false).is_empty());
-        assert!(spans.note(3, 0x48000, 0x49000, false).is_empty());
-        assert!(spans.note(4, 0, 0x100_0000, false).is_empty());
+        assert!(spans.note(1, 0x10000, 0x50000, false, true).is_empty());
+        assert!(spans.note(2, 0x10000, 0x20000, false, true).is_empty());
+        assert!(spans.note(3, 0x48000, 0x49000, false, true).is_empty());
+        assert!(spans.note(4, 0, 0x100_0000, false, true).is_empty());
         let found = |start, end| {
             let mut slots = spans.slots_in(start, end);
             slots.sort_unstable();

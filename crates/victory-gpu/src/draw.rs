@@ -1445,10 +1445,11 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        // Bytes of texture memory staged per frame, and the time of a pass:
-        // `VICTORY_HEAP_TEXTURES_MB` and `VICTORY_HEAP_TEXTURES_MS`. What a
-        // title composes once from textures that still wait in the queue
-        // stays composed of nothing.
+        // Bytes of texture memory staged per frame, and the time of a
+        // frame's passes: `VICTORY_HEAP_TEXTURES_MB` and
+        // `VICTORY_HEAP_TEXTURES_MS`. (Some 23,000 slots wait when the world
+        // of Grand Theft Auto VI opens; its watchdog ends the process when
+        // a frame takes 20 s.)
         let number = |name: &str, otherwise: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(otherwise)
         };
@@ -1461,9 +1462,11 @@ impl State {
         });
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        static TOOK: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            TOOK.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -1513,13 +1516,20 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
+        // Also within a time per frame: the pass runs on a thread that
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        let began = std::time::Instant::now();
+        struct Took(std::time::Instant);
+        impl Drop for Took {
+            fn drop(&mut self) {
+                TOOK.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let before = std::time::Duration::from_micros(TOOK.load(Ordering::Relaxed));
+        let began = Took(std::time::Instant::now());
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || before + began.0.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
