@@ -2390,6 +2390,8 @@ impl Shadow {
             }
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            #[cfg(feature = "diagnostics")]
+            self.note_unmerged("it is not watched", from, 0);
             return true;
         }
         let base = start / PAGE;
@@ -2402,6 +2404,8 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                #[cfg(feature = "diagnostics")]
+                self.note_unmerged("nothing says what was written", a, 0);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2455,6 +2459,8 @@ impl Shadow {
                     };
                     if !free {
                         if runs.len() > *runs_left {
+                            #[cfg(feature = "diagnostics")]
+                            self.note_unmerged("too many changed runs", lo, runs.len());
                             return true;
                         }
                         *runs_left -= runs.len();
@@ -2467,6 +2473,8 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        #[cfg(feature = "diagnostics")]
+                        self.note_unmerged("no snapshot", lo, 0);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -2496,6 +2504,15 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// A settle because title bytes could not be put in beside shader
+    /// writes: why, at which address, and the changed runs there.
+    #[cfg(feature = "diagnostics")]
+    fn note_unmerged(&self, why: &'static str, at: usize, runs: usize) {
+        let mut all = UNMERGED.lock().unwrap_or_else(|e| e.into_inner());
+        let one = all.entry((why, self.start, self.len, at)).or_default();
+        *one = (one.0 + 1, one.1.max(runs));
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -3407,6 +3424,12 @@ fn note_wide(span: (u64, u64), address: u64, len: u64) {
     }
 }
 
+/// [`Shadow::note_unmerged`] since the last frame line: why, the copy's
+/// start and length, the address; how often, and the most changed runs.
+#[cfg(feature = "diagnostics")]
+static UNMERGED: Mutex<std::collections::BTreeMap<(&str, u64, u64, usize), (u32, usize)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
 /// What shaders were found to have written to copies of 32 MiB and more
 /// since the last frame line: the copy's start, the offset and the bytes.
 #[cfg(feature = "diagnostics")]
@@ -3415,6 +3438,15 @@ static FOUND: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 /// The most frequent of them, for the frame line.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_wide(frames: f64) {
+    let unmerged = std::mem::take(&mut *UNMERGED.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut unmerged: Vec<_> = unmerged.into_iter().collect();
+    unmerged.sort_by_key(|u| std::cmp::Reverse(u.1.0));
+    for ((why, start, len, at), (times, runs)) in unmerged.into_iter().take(6) {
+        tracing::info!(
+            "flights settled for title bytes under shader writes, {:.1}x/frame: {why} ({runs} runs) at {at:#x} of {start:#x}+{len:#x}",
+            f64::from(times) / frames
+        );
+    }
     let [looked, changed] = [0, 1].map(|i| DIFFED[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
     tracing::info!("refreshes by difference: {looked:.1} MB a frame looked through, {changed:.1} MB of it had changed");
     tracing::info!(

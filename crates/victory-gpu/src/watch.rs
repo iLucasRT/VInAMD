@@ -397,6 +397,45 @@ fn guarded_writes(first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)>
     Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+/// What the guards' answers are made of, since the last frame line
+/// (diagnostics): answers; blocks in their ranges; answers for wholly clean
+/// ranges; then microseconds of all threads, waiting for the guards' lock,
+/// asking Windows whether it is view memory, reading off the clean blocks,
+/// protecting blocks, looking up and protecting aliases, asking for absent
+/// blocks; and runs protected, blocks in them, aliases protected, askings
+/// for absent blocks.
+#[cfg(feature = "diagnostics")]
+pub(crate) static GUARD_PARTS: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+
+#[cfg(feature = "diagnostics")]
+fn part(i: usize, n: u64) {
+    GUARD_PARTS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// For the frame line: [`GUARD_PARTS`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_guard_parts(frames: f64) {
+    let p = GUARD_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "guards per frame, all threads: {:.0} answers over {:.0} blocks, {:.0} of them wholly clean; {:.1} ms waiting for the lock, \
+         {:.1} ms asking whether it is view memory, {:.1} ms reading off the clean blocks, {:.1} ms protecting {:.0} runs of {:.0} \
+         blocks, {:.1} ms for their aliases ({:.0} protected), {:.1} ms in {:.0} askings for absent blocks",
+        p[0],
+        p[1],
+        p[2],
+        p[3] / 1e3,
+        p[4] / 1e3,
+        p[5] / 1e3,
+        p[6] / 1e3,
+        p[9],
+        p[10],
+        p[7] / 1e3,
+        p[11],
+        p[8] / 1e3,
+        p[12]
+    );
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -467,11 +506,22 @@ fn guard(start: usize, end: usize) -> Option<(Vec<usize>, std::sync::MutexGuard<
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
+    #[cfg(feature = "diagnostics")]
+    let asking = std::time::Instant::now();
     if !known && !is_view(start, end) {
         return None;
     }
     install();
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    {
+        part(4, (waiting - asking).as_micros() as u64);
+        part(3, waiting.elapsed().as_micros() as u64);
+    }
+    #[cfg(feature = "diagnostics")]
+    let reading = std::time::Instant::now();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -481,6 +531,13 @@ fn guard(start: usize, end: usize) -> Option<(Vec<usize>, std::sync::MutexGuard<
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    #[cfg(feature = "diagnostics")]
+    {
+        part(0, 1);
+        part(1, (last - first) as u64);
+        part(5, reading.elapsed().as_micros() as u64);
+        part(2, u64::from(clean.len() == last - first));
+    }
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
         return Some((written, g));
@@ -497,7 +554,14 @@ fn guard(start: usize, end: usize) -> Option<(Vec<usize>, std::sync::MutexGuard<
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
+                #[cfg(feature = "diagnostics")]
+                let asking = std::time::Instant::now();
                 uncommitted_until = uncommitted_end(block);
+                #[cfg(feature = "diagnostics")]
+                {
+                    part(8, asking.elapsed().as_micros() as u64);
+                    part(12, 1);
+                }
             }
             open = block >= uncommitted_until;
             if open {
@@ -586,6 +650,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
+    #[cfg(feature = "diagnostics")]
+    let protecting = std::time::Instant::now();
     if set(from, to) {
         note(g, from, to);
     } else {
@@ -597,6 +663,14 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        part(6, protecting.elapsed().as_micros() as u64);
+        part(9, 1);
+        part(10, (to - from) as u64);
+    }
+    #[cfg(feature = "diagnostics")]
+    let aliasing = std::time::Instant::now();
     // Their aliases read-only too, so a write through them faults; not
     // clean, though: a copy of an alias has not taken them yet.
     let mut others = Vec::new();
@@ -605,12 +679,16 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         for &other in &others {
             if !g.protected.contains(&other) && set(other, other + 1) {
                 g.protected.insert(other);
+                #[cfg(feature = "diagnostics")]
+                part(11, 1);
             }
             // Both ways: a write through either opens the other.
             g.aliased.insert(block);
             g.aliased.insert(other);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    part(7, aliasing.elapsed().as_micros() as u64);
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
