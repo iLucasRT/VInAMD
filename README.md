@@ -15,6 +15,15 @@
   <img src="https://img.shields.io/badge/license-GPL--3.0-2ea44f" alt="GPL-3.0">
 </p>
 
+<h2 align="center">🖥️ Running on</h2>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/CPU-Ryzen%207%205800x3D-ED1C24?style=for-the-badge&logo=amd&logoColor=white" alt="CPU: Ryzen 7 5800x3D">
+  <img src="https://img.shields.io/badge/RAM-64GB-7c3aed?style=for-the-badge" alt="RAM: 64GB">
+  <img src="https://img.shields.io/badge/GPU-RX%207900XTX%2024GB-ED1C24?style=for-the-badge&logo=amd&logoColor=white" alt="GPU: RX 7900XTX 24GB">
+  <img src="https://img.shields.io/badge/Storage-NVMe-2ea44f?style=for-the-badge" alt="Storage: NVMe">
+</p>
+
 <p align="center">
   <a href="#why">Why</a> •
   <a href="#status">Status</a> •
