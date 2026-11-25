@@ -720,6 +720,52 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The put of masked stretches (`crate::host`), on the software adapter:
+    /// the masked bytes are the CPU's side's, the others stay the card's,
+    /// and nothing beside the stretch changes.
+    #[test]
+    fn warp_card_put_stores_only_the_masked_bytes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let put = compile_cs(&warp.device, crate::host::CARD_PUT).expect("the card put must compile on WARP");
+        const SIZE: usize = 4096;
+        let (_cpu, cpu_ptr, cpu_gpu) = warp.shared_buffer(SIZE as u64);
+        let (_mask, mask_ptr, mask_gpu) = warp.shared_buffer(1024);
+        let (_card, card_ptr, card_gpu) = warp.shared_buffer(SIZE as u64);
+        let title: Vec<u8> = (0..SIZE).map(|i| (i * 31 + i / 251) as u8 | 1).collect();
+        let theirs: Vec<u8> = (0..SIZE).map(|i| (i * 7) as u8 & 0xfe).collect();
+        const AT: usize = 1000;
+        const DWORDS: usize = 333;
+        let changed = |i: usize| i % 3 == 1 || (400..480).contains(&i) || i * i % 11 == 4;
+        let mut bits = vec![0u32; DWORDS.div_ceil(8)];
+        for i in (0..DWORDS * 4).filter(|&i| changed(i)) {
+            bits[i / 32] |= 1 << (i % 32);
+        }
+        // SAFETY: the mappings hold what is written; our open list, live
+        // buffers, the put's own root signature.
+        unsafe {
+            std::ptr::copy_nonoverlapping(title.as_ptr(), cpu_ptr, SIZE);
+            std::ptr::copy_nonoverlapping(theirs.as_ptr(), card_ptr, SIZE);
+            std::ptr::copy_nonoverlapping(bits.as_ptr().cast::<u8>(), mask_ptr.add(64), bits.len() * 4);
+            warp.list.SetComputeRootSignature(&put.root);
+            warp.list.SetPipelineState(&put.pso);
+            let constants = [AT as u32, DWORDS as u32, 64];
+            warp.list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, cpu_gpu);
+            warp.list.SetComputeRootShaderResourceView(2, mask_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, card_gpu);
+            warp.list.Dispatch(DWORDS.div_ceil(64) as u32, 1, 1);
+        }
+        warp.submit_and_wait();
+        for i in 0..SIZE {
+            let put = (AT..AT + DWORDS * 4).contains(&i) && changed(i - AT);
+            // SAFETY: inside the mapping.
+            let got = unsafe { card_ptr.add(i).read_volatile() };
+            assert_eq!(got, if put { title[i] } else { theirs[i] }, "{i}");
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
