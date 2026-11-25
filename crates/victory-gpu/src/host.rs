@@ -2488,6 +2488,8 @@ fn late_line(frames: f64) {
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     #[cfg(feature = "diagnostics")]
+    crate::shadow::log_wide(frames);
+    #[cfg(feature = "diagnostics")]
     {
         let blocks = std::mem::take(&mut *BLOCKS.lock().unwrap_or_else(|e| e.into_inner()));
         let mut blocks: Vec<_> = blocks.into_iter().collect();

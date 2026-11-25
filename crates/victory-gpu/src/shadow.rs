@@ -1749,6 +1749,10 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        if len >= 4 << 20 {
+            note_wide(self.span(), address, len);
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2641,6 +2645,13 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        if self.len >= 32 << 20 {
+            let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+            if found.len() < 1 << 16 {
+                found.push((self.start, at, n));
+            }
+        }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
@@ -3183,4 +3194,66 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The shader whose views are being bound on this thread, and how.
+    pub(crate) static BINDING: std::cell::RefCell<(String, &'static str)> = const { std::cell::RefCell::new((String::new(), "")) };
+}
+
+/// Since the last frame line: shader writes declared over 4 MiB and more,
+/// by the copy, the shader and how it names the memory: how often, and the
+/// last range.
+#[cfg(feature = "diagnostics")]
+type Wide = std::collections::BTreeMap<((u64, u64), String, &'static str), (u32, u64, u64)>;
+#[cfg(feature = "diagnostics")]
+static WIDE: Mutex<Wide> = Mutex::new(Wide::new());
+
+#[cfg(feature = "diagnostics")]
+fn note_wide(span: (u64, u64), address: u64, len: u64) {
+    let (shader, how) = BINDING.with(|b| b.borrow().clone());
+    let mut wide = WIDE.lock().unwrap_or_else(|e| e.into_inner());
+    if wide.len() < 4096 {
+        let w = wide.entry((span, shader, how)).or_default();
+        *w = (w.0 + 1, address, len);
+    }
+}
+
+/// What shaders were found to have written to copies of 32 MiB and more
+/// since the last frame line: the copy's start, the offset and the bytes.
+#[cfg(feature = "diagnostics")]
+static FOUND: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+
+/// The most frequent of them, for the frame line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_wide(frames: f64) {
+    let found = std::mem::take(&mut *FOUND.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut copies: Vec<u64> = found.iter().map(|f| f.0).collect();
+    copies.sort_unstable();
+    copies.dedup();
+    for copy in copies {
+        let mut mine: Vec<(usize, usize)> = found.iter().filter(|f| f.0 == copy).map(|f| (f.1, f.2)).collect();
+        let pieces = mine.len();
+        let bytes: usize = mine.iter().map(|m| m.1).sum();
+        mine.sort_unstable();
+        mine.dedup();
+        tracing::info!(
+            "shader writes found in {copy:#x}: {:.1} pieces and {} bytes a frame; e.g. {:x?}",
+            pieces as f64 / frames,
+            (bytes as f64 / frames) as u64,
+            mine.iter().step_by((mine.len() / 12).max(1)).take(12).collect::<Vec<_>>()
+        );
+    }
+    let wide = std::mem::take(&mut *WIDE.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut wide: Vec<_> = wide.into_iter().collect();
+    wide.sort_by_key(|w| std::cmp::Reverse((w.0.0.1, w.1.0)));
+    for ((span, shader, how), (times, address, len)) in wide.into_iter().take(14) {
+        tracing::info!(
+            "shader writes declared wide, {:.1}x/frame: {shader} by {how} over {address:#x}+{len:#x} of {:#x}+{:#x}",
+            f64::from(times) / frames,
+            span.0,
+            span.1
+        );
+    }
 }

@@ -901,6 +901,8 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::BINDING.with(|b| *b.borrow_mut() = (stage.shader.hash.to_string(), "a table's view"));
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -911,6 +913,8 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::BINDING.with(|b| b.borrow_mut().1 = "raw addresses");
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
@@ -1025,6 +1029,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::shadow::BINDING.with(|b| b.borrow_mut().1 = "a root view");
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.

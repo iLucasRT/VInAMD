@@ -304,8 +304,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
+    // View memory, known by a guard of ours: not the kernel's to answer.
+    if guarded && known_view(start) && asked(start, end).is_none() {
+        return guarded_writes(first, last);
+    }
+    let mut held = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -332,20 +336,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        #[cfg(feature = "diagnostics")]
-        let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
-    } else {
-        Vec::new()
-    };
+    if failed {
+        drop(held);
+        return if guarded { guarded_writes(first, last) } else { None };
+    }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -355,8 +349,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for k in 0..count {
+        let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
     Some((
@@ -366,6 +360,41 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// Whether the block at `start` is guarded, or noted absent: view memory.
+fn known_view(start: usize) -> bool {
+    let g = guards();
+    let first = start / BLOCK;
+    g.protected.contains(&first) || g.absent.contains(&first)
+}
+
+/// [`writes`] of view memory, pages `[first, last)`. The guards are asked
+/// before the journal is taken: protecting blocks is slow, and every other
+/// refresh waited behind it for an answer the journal had. They are held
+/// until the journal has what they said, so that nobody finds a block clean
+/// whose write is not noted yet. (Guards, then journal: no one takes them
+/// the other way round.)
+fn guarded_writes(first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    #[cfg(feature = "diagnostics")]
+    let guarding = std::time::Instant::now();
+    let (written, held) = guard(first * PAGE, last * PAGE)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::GuardUs, guarding.elapsed().as_micros() as u64);
+        add(C::Watches, 1);
+        add(C::WatchUs, guarding.elapsed().as_micros() as u64);
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    j.asked += 1;
+    let now = j.asked;
+    for page in written {
+        j.written.insert(page, now);
+    }
+    drop(held);
+    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// Guarded blocks of view memory.
@@ -423,7 +452,8 @@ fn aliases_of(block: usize, out: &mut Vec<usize>) {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+/// The guards come back held with the answer.
+fn guard(start: usize, end: usize) -> Option<(Vec<usize>, std::sync::MutexGuard<'static, Guards>)> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -453,7 +483,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+        return Some((written, g));
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -488,7 +518,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             protect(&mut g, from, block);
         }
     }
-    Some(written)
+    Some((written, g))
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -846,7 +876,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(guard(view, view + 2 * BLOCK).map(|(w, _)| w).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -866,7 +896,7 @@ mod tests {
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            guard(view, view + 2 * BLOCK).map(|(w, _)| w),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         // SAFETY: our view.
@@ -924,7 +954,7 @@ mod tests {
         let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
         commit(start, BLOCK);
         commit(early, KERNEL_PAGE);
-        let refresh = || guard(start, start + SIZE).unwrap();
+        let refresh = || guard(start, start + SIZE).map(|(w, _)| w).unwrap();
         assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
         // The last block is still entirely reserved.
         assert!(!refresh().contains(&(late / PAGE)));
@@ -1005,15 +1035,15 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         // The range begins in the placeholder, its middle block is a view.
         assert!(is_view(p, p + 3 * BLOCK));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()), "nothing written since");
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(Vec::new()), "nothing written since");
         // SAFETY: inside the mapped middle block.
         unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(pages(1).collect()));
         let first = map(0);
         title_memory_remapped(p, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(0).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(pages(0).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(Vec::new()));
         // Memory of ours that is no view stays none.
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
@@ -1092,16 +1122,16 @@ mod tests {
         let first = map(0);
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(all));
         assert_eq!(
-            guard(p, p + 3 * BLOCK),
+            guard(p, p + 3 * BLOCK).map(|(w, _)| w),
             Some(Vec::new()),
             "nothing written since"
         );
         let second = map(1);
         title_memory_remapped(p + BLOCK, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(pages(1).collect()));
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|(w, _)| w), Some(Vec::new()));
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1163,19 +1193,19 @@ mod tests {
         B.store(b, Ordering::Relaxed);
         set_alias_lookup(lookup);
         // A copy of view `a` takes the block and guards it (and `b`).
-        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
-        assert_eq!(guard(a, a + BLOCK), Some(vec![]), "clean");
+        assert_eq!(guard(a, a + BLOCK).map(|(w, _)| w), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK).map(|(w, _)| w), Some(vec![]), "clean");
         // The title writes the page through `b`: `a` shows it written.
         // SAFETY: our view; the guard's handler opens it.
         unsafe { ((b + 8) as *mut u8).write_volatile(7) };
         // SAFETY: the same byte through the other view.
         assert_eq!(unsafe { ((a + 8) as *const u8).read_volatile() }, 7);
-        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]), "written through the alias");
+        assert_eq!(guard(a, a + BLOCK).map(|(w, _)| w), Some(vec![a / PAGE]), "written through the alias");
         // And the other way round: a kernel write into `a` opens `b`.
-        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
-        assert_eq!(guard(b, b + BLOCK), Some(vec![]));
+        assert_eq!(guard(b, b + BLOCK).map(|(w, _)| w), Some(vec![b / PAGE]));
+        assert_eq!(guard(b, b + BLOCK).map(|(w, _)| w), Some(vec![]));
         writing(a + 16, 4);
-        assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        assert_eq!(guard(b, b + BLOCK).map(|(w, _)| w), Some(vec![b / PAGE]));
         A.store(0, Ordering::Relaxed);
         B.store(0, Ordering::Relaxed);
         for v in [a, b] {
