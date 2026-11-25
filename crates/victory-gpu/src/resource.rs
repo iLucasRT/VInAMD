@@ -1588,10 +1588,50 @@ impl HostTexture {
     }
 }
 
+/// Host textures let go lately (diagnostics, with `VICTORY_D3D12_DRED`):
+/// when, on which thread, which, and how many references it had left; the
+/// device's removal names the freed resource a shader read.
+#[cfg(all(windows, feature = "diagnostics"))]
+static LET_GO: std::sync::Mutex<std::collections::VecDeque<(u64, u32, String, usize, u32)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// For the removal line: those of `named` (the host's names of freed
+/// resources) that were let go lately.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn let_go_lately(named: &str) -> String {
+    let now = crate::host::now_us();
+    let all = LET_GO.lock().unwrap_or_else(|e| e.into_inner());
+    let hits: Vec<String> = all
+        .iter()
+        .rev()
+        .filter(|l| named.contains(&format!("at {:p}", l.3 as *const c_void)))
+        .take(8)
+        .map(|(at, thread, name, which, left)| {
+            format!("{:.1} ms before on thread {thread} ({name}): {:p}, {left} references left", now.saturating_sub(*at) as f64 / 1e3, *which as *const c_void)
+        })
+        .collect();
+    format!("of {} host textures let go lately: {hits:?}", all.len())
+}
+
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
+        if crate::host::dred_on() {
+            use windows::core::Interface;
+            let mut all = LET_GO.lock().unwrap_or_else(|e| e.into_inner());
+            if all.len() >= 1 << 16 {
+                all.pop_front();
+            }
+            all.push_back((
+                crate::host::now_us(),
+                crate::host::thread_id(),
+                std::thread::current().name().unwrap_or("title").to_string(),
+                self.texture.as_raw() as usize,
+                crate::host::references(&self.texture) - 1,
+            ));
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -1730,7 +1770,8 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            use windows::core::Interface;
+            format!("texture {}x{} f{} flags {:#x} at {:p}", d.width, d.height, d.format, d.flags, t.as_raw())
         });
     }
     texture

@@ -4617,6 +4617,8 @@ impl Host {
                     }
                     if !names.is_empty() {
                         text.push_str(&format!("; {what} {names:?}"));
+                        #[cfg(feature = "diagnostics")]
+                        text.push_str(&format!("; {}", crate::resource::let_go_lately(&names.join(" "))));
                     }
                 }
                 text.push_str(&crate::shadow::near(va));
