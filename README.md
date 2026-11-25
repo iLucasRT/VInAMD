@@ -1,3 +1,12 @@
+<h2 align="center">🖥️ Running on</h2>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/CPU-Ryzen%207%205800x3D-ED1C24?style=for-the-badge&logo=amd&logoColor=white" alt="CPU: Ryzen 7 5800x3D">
+  <img src="https://img.shields.io/badge/RAM-64GB-7c3aed?style=for-the-badge" alt="RAM: 64GB">
+  <img src="https://img.shields.io/badge/GPU-RX%207900XTX%2024GB-ED1C24?style=for-the-badge&logo=amd&logoColor=white" alt="GPU: RX 7900XTX 24GB">
+  <img src="https://img.shields.io/badge/Storage-NVMe-2ea44f?style=for-the-badge" alt="Storage: NVMe">
+</p>
+
 <h1 align="center">
   <img src="docs/klbf/logo.svg" alt="KLBF Lab" width="160">
   <br>
@@ -13,15 +22,6 @@
   <img src="https://img.shields.io/badge/tested%20on-AMD%20RX%209070%20XT-c04fb0" alt="tested on RX 9070 XT">
   <img src="https://img.shields.io/badge/AMD-first%20gameplay%20scene%20drawn-ffb000" alt="first gameplay scene drawn on AMD">
   <img src="https://img.shields.io/badge/license-GPL--3.0-2ea44f" alt="GPL-3.0">
-</p>
-
-<h2 align="center">🖥️ Running on</h2>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/CPU-Ryzen%207%205800x3D-ED1C24?style=for-the-badge&logo=amd&logoColor=white" alt="CPU: Ryzen 7 5800x3D">
-  <img src="https://img.shields.io/badge/RAM-64GB-7c3aed?style=for-the-badge" alt="RAM: 64GB">
-  <img src="https://img.shields.io/badge/GPU-RX%207900XTX%2024GB-ED1C24?style=for-the-badge&logo=amd&logoColor=white" alt="GPU: RX 7900XTX 24GB">
-  <img src="https://img.shields.io/badge/Storage-NVMe-2ea44f?style=for-the-badge" alt="Storage: NVMe">
 </p>
 
 <p align="center">
