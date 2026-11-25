@@ -1189,10 +1189,10 @@ impl HostHeap {
         buffers.iter().copied().collect()
     }
 
-    /// Of [`HostHeap::buffer_slots`] part `part` of `parts`.
-    pub(crate) fn buffer_slots_slice(&self, part: u32, parts: u32) -> Vec<u32> {
+    /// Of [`HostHeap::buffer_slots`] those `wanted` says yes of.
+    pub(crate) fn buffer_slots_some(&self, wanted: impl Fn(u32) -> bool) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().filter(|slot| slot % parts == part).collect()
+        buffers.iter().copied().filter(|&slot| wanted(slot)).collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the

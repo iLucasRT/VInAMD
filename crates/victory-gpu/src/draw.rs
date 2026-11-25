@@ -69,13 +69,16 @@ fn grow(spans: &mut Spans, shadow: &std::sync::Arc<crate::shadow::Shadow>, from:
 }
 
 /// Into how many parts the pass over buffer views picked by index divides
-/// them, looking at one part each time beside what changed, and keeping what
-/// they add up to (`VICTORY_HEAP_SLICES`, 16; 0: all of them every sixteenth
-/// time, and added up every time, as before).
+/// those it has brought up to date, looking at one part each time beside what
+/// changed, and keeping what they add up to (`VICTORY_HEAP_SLICES`, 128; 0:
+/// all of them every sixteenth time, and added up every time, as before).
+/// Those without a host copy yet are asked again every sixteenth time. A look
+/// costs some 3.5 microseconds: a sixteenth of 320,000 views was 80 ms of a
+/// frame (runs DB1, DB2).
 fn heap_slices() -> u64 {
     static PARTS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PARTS.get_or_init(|| {
-        std::env::var("VICTORY_HEAP_SLICES").ok().and_then(|v| v.trim().parse().ok()).map_or(16, |n: u64| n.min(256))
+        std::env::var("VICTORY_HEAP_SLICES").ok().and_then(|v| v.trim().parse().ok()).map_or(128, |n: u64| n.min(1024))
     })
 }
 
@@ -414,6 +417,7 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 /// Slots whose texture another slot had uploaded since.
 pub(crate) static HEAP_TEXTURES_SAME: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_TEXTURES_KEPT: AtomicU64 = AtomicU64::new(0);
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
@@ -1421,7 +1425,12 @@ impl State {
         let first = *passes == 0;
         let slots = if sliced && !first {
             let mut slots = changed;
-            slots.extend(host.buffer_slots_slice((*passes % parts) as u32, parts as u32));
+            let (part, asked) = ((*passes % parts) as u32, (*passes % 16) as u32);
+            slots.extend(
+                host.buffer_slots_some(|slot| slot % parts as u32 == part || slot % 16 == asked)
+                    .into_iter()
+                    .filter(|slot| slot % parts as u32 == part || !ranges.contains_key(slot)),
+            );
             slots
         } else if *passes % 16 == 0 {
             ranges.clear();
@@ -1773,6 +1782,8 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             let mut partly = None;
+            // The memory of a placed texture.
+            let mut memory = None;
             // Made ready by threads of their own, if any (`crate::ahead`);
             // not for a run made early, whose draws need them now.
             let mut ahead = None;
@@ -1782,6 +1793,7 @@ impl State {
                     ahead = Some((address, resource));
                 }
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                memory = Some((address, len as usize));
                 let part = crate::host::PartTime::new(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 drop(part);
@@ -1875,6 +1887,25 @@ impl State {
                 host.texture_slot_done(index, write, partly.map(|mapped| (frame + 1, mapped)));
                 continue;
             }
+            // Its memory holds what it held when it was uploaded.
+            let mut digest = 0;
+            if !tabled
+                && !ours
+                && placed.is_some()
+                && crate::texture::pick_digest()
+                && let Some((at, len)) = memory
+            {
+                let before = crate::texture::picked_digest(resource as usize, there);
+                let part = crate::host::PartTime::new(9);
+                digest = crate::texture::digest(at as *const u8, len);
+                drop(part);
+                if before != 0 && before == digest {
+                    HEAP_TEXTURES_KEPT.fetch_add(1, Ordering::Relaxed);
+                    crate::texture::picked_again(resource as usize, frame);
+                    host.texture_slot_done(index, write, partly.map(|mapped| (frame + 1, mapped)));
+                    continue;
+                }
+            }
             if let Some(view) = &view {
                 let _part = crate::host::PartTime::new(3);
                 readable(list, sampled.kind, view);
@@ -1932,7 +1963,7 @@ impl State {
                 crate::host::PICKED_UPLOADS[2 * kind].fetch_add(1, Ordering::Relaxed);
                 crate::host::PICKED_UPLOADS[2 * kind + 1].fetch_add(bytes, Ordering::Relaxed);
             }
-            crate::texture::note_picked(resource as usize, frame, there);
+            crate::texture::note_picked(resource as usize, frame, there, digest);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

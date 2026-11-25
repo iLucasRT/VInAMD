@@ -2516,8 +2516,10 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
 /// view, 3 recording its upload (with its staging buffer), 4 letting the
 /// staging buffer go; and, on all threads and wherever asked: 5 upload
 /// buffers made, 6 host textures made, 7 buffer views brought up to date, 8
-/// the spans of the copies and their refreshes noted.
-pub(crate) static PASS_PARTS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+/// the spans of the copies and their refreshes noted; 9 whether a texture's
+/// memory is as it was; 10 a texture detiled, 11 hashed (memory not watched),
+/// 12 read through a copy (on all threads).
+pub(crate) static PASS_PARTS: [std::sync::atomic::AtomicU64; 26] = [const { std::sync::atomic::AtomicU64::new(0) }; 26];
 
 /// Adds the time it lives to a part of [`PASS_PARTS`].
 pub(crate) struct PartTime(usize, std::time::Instant);
@@ -2542,10 +2544,17 @@ pub(crate) static PICKED_UPLOADS: [std::sync::atomic::AtomicU64; 6] = [const { s
 
 fn parts_line(frames: f64) {
     let n: Vec<f64> = PASS_PARTS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let kept = crate::draw::HEAP_TEXTURES_KEPT.swap(0, Ordering::Relaxed) as f64 / frames;
     if n[1] + n[11] + n[13] > 0.0 {
         tracing::info!(
-            "texture pass parts per frame: which slots are due {:.1} ms; how much is mapped {:.1} ms in {:.0}; host texture and view {:.1} ms in {:.0}; upload recorded {:.1} ms in {:.0}; staging let go {:.1} ms in {:.0}; of these and elsewhere: upload buffers made {:.1} ms in {:.0}, host textures made {:.1} ms in {:.0}; buffer views {:.1} ms in {:.0}, their copies {:.1} ms",
-            n[0] / 1e3, n[2] / 1e3, n[3], n[4] / 1e3, n[5], n[6] / 1e3, n[7], n[8] / 1e3, n[9], n[10] / 1e3, n[11], n[12] / 1e3, n[13], n[14] / 1e3, n[15], n[16] / 1e3
+            "texture pass parts per frame: whether memory is as it was {:.1} ms in {:.0} ({:.0} were); which slots are due {:.1} ms; how much is mapped {:.1} ms in {:.0}; host texture and view {:.1} ms in {:.0}; upload recorded {:.1} ms in {:.0}; staging let go {:.1} ms in {:.0}; of these and elsewhere: upload buffers made {:.1} ms in {:.0}, host textures made {:.1} ms in {:.0}; buffer views {:.1} ms in {:.0}, their copies {:.1} ms; textures detiled {:.1} ms in {:.0}, hashed {:.1} ms, read through a copy {:.1} ms",
+            n[18] / 1e3, n[19], kept, n[0] / 1e3, n[2] / 1e3, n[3], n[4] / 1e3, n[5], n[6] / 1e3, n[7], n[8] / 1e3, n[9], n[10] / 1e3, n[11], n[12] / 1e3, n[13], n[14] / 1e3, n[15], n[16] / 1e3, n[20] / 1e3, n[21], n[22] / 1e3, n[24] / 1e3
+        );
+    }
+    let [taken, made, spilled] = [0, 1, 2].map(|i| crate::texture::POOLED[i].load(Ordering::Relaxed));
+    if taken + made > 0 {
+        tracing::info!(
+            "staging buffers since the start: {taken} used again, {made} made, {spilled} let go as too many (VICTORY_STAGING_POOL_MB)"
         );
     }
     let u: Vec<f64> = PICKED_UPLOADS.iter().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames).collect();
