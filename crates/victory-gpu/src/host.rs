@@ -381,14 +381,17 @@ fn card_clock_watch(clock: &'static CardClock) {
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
-fn card_clock_line(frames: f64, ms: f64) {
+///
+/// Returns how much of the time the card was busy, in percent.
+fn card_clock_line(frames: f64, ms: f64) -> f64 {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    let busy = if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 };
     tracing::info!(
-        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
+        "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {busy:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
-         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms",
-        if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
+         had not submitted; the submitting thread stood waiting for the card {stood:.1} ms"
     );
+    busy
 }
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
@@ -428,8 +431,8 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
+/// The process's private bytes (the window's caption; in diagnostics builds,
+/// around the making of lists).
 fn private_bytes() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -440,6 +443,18 @@ fn private_bytes() -> u64 {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     c.PagefileUsage as u64
+}
+
+/// The PC's memory in bytes: physical memory free, and what is left to
+/// commit.
+pub(crate) fn system_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { GlobalMemoryStatusEx(&mut m) };
+    (m.ullAvailPhys, m.ullAvailPageFile)
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a
@@ -5686,6 +5701,10 @@ struct Presenter {
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
+    /// When the last frame was presented, and the longest one since the
+    /// caption was last set.
+    last: std::time::Instant,
+    longest: std::time::Duration,
     frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
@@ -5695,11 +5714,77 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// Whether the window's caption also tells where a frame's time goes and
+/// the memory in use (`VICTORY_TITLE_STATS=0`: the frame rate only).
+fn title_stats() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_STATS").is_none_or(|v| v != "0"))
+}
+
+/// What the caption tells beside the frame rate, over the last second. The
+/// times are milliseconds of a frame; they overlap and do not add up.
+struct Stats {
+    /// The longest frame.
+    peak_ms: f64,
+    /// Preparing submissions on the CPU, and copying title memory in it.
+    cpu_ms: f64,
+    copies_ms: f64,
+    /// Bringing what shaders wrote back to title memory.
+    readback_ms: f64,
+    /// The card had work of ours queued: milliseconds, and percent of the
+    /// time; and our threads waited for it.
+    gpu_ms: f64,
+    gpu_busy: f64,
+    gpu_wait_ms: f64,
+    /// Bytes of the card's memory in use by this process, and what the
+    /// system lets it use.
+    vram: Option<(u64, u64)>,
+    /// Bytes: the process's private memory; physical memory free in the PC;
+    /// what the system can still commit.
+    ram: u64,
+    ram_free: u64,
+    commit_free: u64,
+    /// Pipelines queued and not made yet, texture slots due for an upload.
+    pipelines: u64,
+    textures: u64,
+}
+
+impl std::fmt::Display for Stats {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let gb = |bytes: u64| bytes as f64 / f64::from(1 << 30);
+        write!(
+            f,
+            " | peak {:.0} ms | CPU {:.0} ms (copies {:.0}) | readback {:.0} ms | GPU {:.0} ms ({:.0}% busy), wait {:.0}",
+            self.peak_ms,
+            self.cpu_ms,
+            self.copies_ms,
+            self.readback_ms,
+            self.gpu_ms,
+            self.gpu_busy,
+            self.gpu_wait_ms
+        )?;
+        if let Some((used, budget)) = self.vram {
+            write!(f, " | VRAM {:.1}/{:.1} GB", gb(used), gb(budget))?;
+        }
+        write!(
+            f,
+            " | RAM {:.1} GB, {:.1} free, commit {:.1} free | pending {} pipelines, {} textures",
+            gb(self.ram),
+            gb(self.ram_free),
+            gb(self.commit_free),
+            self.pipelines,
+            self.textures
+        )
+    }
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
             since: now,
+            last: now,
+            longest: std::time::Duration::ZERO,
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
@@ -5716,6 +5801,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.longest = self.longest.max(self.last.elapsed());
+        self.last = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -5730,6 +5817,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        let longest = std::mem::take(&mut self.longest);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -5749,7 +5837,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
-        card_clock_line(frames, ms);
+        let gpu_busy = card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5908,7 +5996,26 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | KLBF Lab (VIctory) {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text = format!(" | KLBF Lab (VIctory) {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        if title_stats() {
+            let (ram_free, commit_free) = system_memory();
+            text += &Stats {
+                peak_ms: longest.as_secs_f64() * 1e3,
+                cpu_ms: cpu,
+                copies_ms: copy_ms,
+                readback_ms: back_ms,
+                gpu_ms: ms * gpu_busy / 100.0,
+                gpu_busy,
+                gpu_wait_ms: gpu,
+                vram: host().and_then(|h| h.video_memory()).map(|[budget, used, ..]| (used, budget)),
+                ram: private_bytes(),
+                ram_free,
+                commit_free,
+                pipelines: crate::pipeline::making(),
+                textures: crate::draw::HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
+            }
+            .to_string();
+        }
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -6549,5 +6656,38 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::Stats;
+
+    /// The caption tells every part, in its order; a card that does not
+    /// tell its memory leaves that part out.
+    #[test]
+    fn the_caption_tells_every_part() {
+        let mut stats = Stats {
+            peak_ms: 189.6,
+            cpu_ms: 101.6,
+            copies_ms: 69.1,
+            readback_ms: 104.0,
+            gpu_ms: 99.8,
+            gpu_busy: 61.7,
+            gpu_wait_ms: 46.0,
+            vram: Some((13 << 30, 23 << 30)),
+            ram: 27 << 30,
+            ram_free: 25 << 30,
+            commit_free: 11 << 29,
+            pipelines: 12,
+            textures: 340,
+        };
+        assert_eq!(
+            stats.to_string(),
+            " | peak 190 ms | CPU 102 ms (copies 69) | readback 104 ms | GPU 100 ms (62% busy), wait 46 | VRAM 13.0/23.0 GB \
+             | RAM 27.0 GB, 25.0 free, commit 5.5 free | pending 12 pipelines, 340 textures"
+        );
+        stats.vram = None;
+        assert!(!stats.to_string().contains("VRAM"));
     }
 }
