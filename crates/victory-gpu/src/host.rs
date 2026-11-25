@@ -523,6 +523,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
+            if dred_on() {
+                text.push_str(&host.removal_data(&[]));
+            }
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
