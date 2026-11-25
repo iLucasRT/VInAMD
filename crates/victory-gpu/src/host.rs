@@ -3208,6 +3208,7 @@ impl Host {
     }
 
     /// Whether the host GPU supports the depth bounds test; logged once.
+    /// `VICTORY_DEPTH_BOUNDS=0`: no, as before the test was passed on.
     pub(crate) fn depth_bounds(&self) -> bool {
         static BOUNDS: OnceLock<bool> = OnceLock::new();
         *BOUNDS.get_or_init(|| {
@@ -3222,7 +3223,8 @@ impl Host {
                     )
                     .is_ok()
             };
-            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            let off = std::env::var_os("VICTORY_DEPTH_BOUNDS").is_some_and(|v| v == "0");
+            let supported = ok && options.DepthBoundsTestSupported.as_bool() && !off;
             tracing::info!(supported, "host depth bounds support");
             supported
         })

@@ -112,10 +112,23 @@ pub use sampler::StaticSampler;
 pub use lower::{set_host_max_wave, set_host_pixel_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CONSTANT, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
+
+/// Whether a raw access to a buffer the program picks from the view heap by
+/// an index it computes is kept inside the view it finds there
+/// (`VICTORY_PICK_BOUND=0`: not). The host's views are typed and structured
+/// ones too, and AMD's hardware holds a raw access through those to nothing
+/// but the element index (here 0): a byte offset read out of memory that
+/// holds something else went anywhere in the 4 GiB above the view (Radeon GPU
+/// Detective named such a load in the title's `fc5e66f8f873d3bb`). Part of
+/// the translation: the shader cache keys on it.
+pub fn pick_bound() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PICK_BOUND").is_none_or(|v| v != "0"))
+}
 
 /// What the translation depends on beside the container and the code: what
 /// the host was found to be, as it was told to the translator so far.

@@ -5537,7 +5537,16 @@ impl<'a> Lower<'a> {
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let bound = super::pick_bound();
+            let is_buffer = match self.picked_bound(site, src, 0, addr)? {
+                // A constant buffer view is read as one, below.
+                Some(inside) => {
+                    let buffer = self.s.m.cmp(self.cur, pred::SGT, stride, zero);
+                    let no = self.s.m.bool(false);
+                    self.s.m.select(self.cur, buffer, inside, no)
+                }
+                None => self.s.m.cmp(self.cur, pred::NE, stride, zero),
+            };
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5560,7 +5569,8 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let constant = if bound { pred::SLT } else { pred::EQ };
+            let other = self.s.m.cmp(self.cur, constant, stride, zero);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -6451,6 +6461,40 @@ impl<'a> Lower<'a> {
         let v = self.as_int(f);
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// Whether a raw access from `byte` on, through the buffer view `src`
+    /// names, begins inside that view, if the program picks the view from the
+    /// heap by an index it computes ([`super::pick_bound`]). `u`: the
+    /// unordered bit of the access's handle. A slot with a constant buffer
+    /// view has no bytes per element here: such accesses are left as they
+    /// are.
+    fn picked_bound(&mut self, site: Site, src: &Source, u: u32, byte: V) -> Result<Option<V>, Why> {
+        if !super::pick_bound() {
+            return Ok(None);
+        }
+        let Some(stride) = self.slot_stride(src)? else {
+            return Ok(None);
+        };
+        let h = self.handle(site, src, false, (11 | u, 0))?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        // Elements (typed and structured views) times the bytes of each; of
+        // a raw view bytes already, which the hardware bounds itself.
+        let elements = self.s.m.extract(c, d, 0);
+        let bytes = self.s.m.bin(c, Bin::Mul, elements, stride);
+        let over = self.mul_hi(elements, stride, false);
+        let zero = self.s.m.i32(0);
+        let all = self.s.m.i32(u32::MAX);
+        let over = self.s.m.cmp(c, pred::NE, over, zero);
+        let bytes = self.s.m.select(c, over, all, bytes);
+        let inside = self.s.m.cmp(c, pred::IULT, byte, bytes);
+        let constant = self.s.m.cmp(c, pred::SLT, stride, zero);
+        let yes = self.s.m.bool(true);
+        Ok(Some(self.s.m.select(c, constant, yes, inside)))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -10099,6 +10143,12 @@ impl<'a> Lower<'a> {
             && !typed
             && used.is_none()
         {
+            let stride = if super::pick_bound() {
+                let size = self.s.m.i32(!super::shader::SLOT_CONSTANT);
+                self.s.m.bin(c, Bin::And, stride, size)
+            } else {
+                stride
+            };
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
@@ -10145,6 +10195,21 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        // Picked by a computed index and accessed as raw bytes: only inside
+        // the view the slot holds ([`super::pick_bound`]).
+        let inside = if index.is_none() && !typed && used.is_none() {
+            self.picked_bound(site, src, u, off)?
+        } else {
+            None
+        };
+        // What an access that changes memory runs under.
+        let guarded = match (guard, inside) {
+            (Some(g), Some(i)) => {
+                let no = self.s.m.bool(false);
+                Some(self.s.m.select(c, g, i, no))
+            }
+            (g, i) => g.or(i),
+        };
         if let Some((bits, signed)) = narrow {
             // Below a dword: raw buffers are read and written in dwords on
             // 4 bytes, so the dword that holds the value is read and
@@ -10173,6 +10238,9 @@ impl<'a> Lower<'a> {
             if !store {
                 let mask = self.s.m.i8(1);
                 let align = self.s.m.i32(4);
+                let held = self.begin_guarded(inside);
+                let c = self.cur;
+                let h = self.handle(site, src, false, (11 | u, 0))?;
                 let dword = |l: &mut Self, at: V| {
                     let r = l.s.op(
                         c,
@@ -10199,6 +10267,7 @@ impl<'a> Lower<'a> {
                     x = self.s.m.bin(c, Bin::Shl, x, up);
                     x = self.s.m.bin(c, Bin::AShr, x, up);
                 }
+                let x = self.end_guarded(held, &[(x, zero)])[0];
                 let Some(Operand::Vector { reg, .. }) = *data else {
                     return Err("a buffer result");
                 };
@@ -10216,7 +10285,7 @@ impl<'a> Lower<'a> {
             let set_next = self.s.m.bin(c, Bin::LShr, v, k8);
             let (and, or) = (self.s.m.i32(1), self.s.m.i32(2));
             let i32t = self.s.t.i32;
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(guarded);
             for (op, x) in [(and, keep), (or, set)] {
                 let args = [h, op, aligned, iu, iu, x];
                 self.s
@@ -10261,7 +10330,7 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(guarded);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -10354,7 +10423,7 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(guarded);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
@@ -10364,15 +10433,21 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let held = self.begin_guarded(inside);
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let zero = self.s.m.i32(0);
+            let values: Vec<(V, V)> =
+                self.format_load(h, off, f, count)?.into_iter().map(|x| (x, zero)).collect();
+            for (k, x) in self.end_guarded(held, &values).into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
+        let held = self.begin_guarded(inside);
+        let c = self.cur;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -10438,6 +10513,19 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
+        if held.is_some() {
+            // (Not typed, so not d16.)
+            let zero = self.s.m.i32(0);
+            let mut values = Vec::new();
+            for k in 0..count {
+                let x = self.s.m.extract(c, r, k);
+                values.push((self.as_int(x), zero));
+            }
+            for (k, x) in self.end_guarded(held, &values).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);

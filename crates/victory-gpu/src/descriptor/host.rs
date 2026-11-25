@@ -495,6 +495,8 @@ fn view_stride(view: &View) -> Option<u32> {
         View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
             (d[..10].try_into().ok()?, *unordered)
         }
+        // Told from a slot with nothing a shader may read as a buffer.
+        View::Constant(..) if victory_shader::emit::pick_bound() => return Some(victory_shader::emit::SLOT_CONSTANT),
         _ => return None,
     };
     // SAFETY: buffer views' union members.
@@ -611,10 +613,13 @@ fn slots_at(va: u64) -> String {
         read += n;
         first += n;
     }
-    found.sort_by_key(|f| f.0);
+    // Buffers that reach the address first (the largest too may be far
+    // below it), then what starts nearest before it.
+    found.sort_by_key(|f| (f.3 == 0, f.0));
+    let buffers = found.iter().filter(|f| f.3 != 0).count();
     let count = found.len();
-    let mut text = format!("; view heap slots read {read} of {total} (cpu {:#x}), {set} with an address, {count} of them at or before the fault", heap.cpu);
-    for (behind, slot, w, bytes) in found.into_iter().take(24) {
+    let mut text = format!("; view heap slots read {read} of {total} (cpu {:#x}), {set} with an address, {count} of them at or before the fault ({buffers} of them buffers)", heap.cpu);
+    for (behind, slot, w, bytes) in found.into_iter().take(40) {
         let kept = heap
             .kept
             .try_lock()
@@ -1265,7 +1270,7 @@ impl HostHeap {
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let was = if stride.is_some() {
+        let was = if stride.is_some_and(|s| s != victory_shader::emit::SLOT_CONSTANT) {
             buffers.insert(index);
             true
         } else {

@@ -83,6 +83,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_NAN_GUARD",
                     "VICTORY_HOST_WAVE",
                     "VICTORY_PS_HALVES",
+                    "VICTORY_PICK_BOUND",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

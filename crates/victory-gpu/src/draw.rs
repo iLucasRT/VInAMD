@@ -2935,6 +2935,13 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || {
         format!("DEPTH BOUNDS {min}..{max}")
     });
+    // What no host is asked to make sense of: said a few times.
+    if !(min.is_finite() && max.is_finite() && (0.0..=1.0).contains(&min) && (0.0..=1.0).contains(&max) && min <= max) {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(min, max, "the title sets depth bounds out of order or range");
+        }
+    }
     if crate::host::host().is_some_and(|h| h.depth_bounds())
         && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
     {
