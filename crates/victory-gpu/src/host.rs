@@ -2687,6 +2687,14 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     back
 }
 
+/// The title memory the shaders that declared `back` are expected to write
+/// (`Shadow::expected_writes`).
+fn expected_writes(back: &[Declared]) -> Vec<(usize, usize)> {
+    back.iter()
+        .flat_map(|(shadow, ranges)| ranges.iter().flat_map(|&range| shadow.expected_writes(range)))
+        .collect()
+}
+
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
 ///
@@ -3511,7 +3519,7 @@ impl Host {
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(expected_writes(&flight.back));
                 }
             }
             join_ranges(written, ranges);
@@ -3686,7 +3694,7 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, expected_writes(&sent.back));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3730,7 +3738,7 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, expected_writes(&sent.back));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {

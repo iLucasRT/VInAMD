@@ -40,6 +40,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Where shaders that declare all of the copy written were found to
+    /// write it ([`Shadow::expected_writes`]).
+    wide: Mutex<WideWrites>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -77,6 +80,33 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// What is known of the writes of shaders that declare much more of a copy
+/// written than they write ([`Shadow::expected_writes`]).
+#[derive(Default)]
+struct WideWrites {
+    /// The frame (plus one) such a range was first declared in; 0: never.
+    since: u64,
+    /// The 64 KiB pieces found written outside every narrow range.
+    pieces: std::collections::BTreeSet<usize>,
+}
+
+/// A declared range this long says little of where the shader writes.
+const WIDE: usize = 4 << 20;
+/// The piece such writes are known by.
+const WIDE_PIECE: usize = 64 << 10;
+/// Frames such writes are looked at before what they say is gone by.
+const WIDE_FRAMES: u64 = 90;
+
+/// Pieces found written after [`WIDE_FRAMES`], which were not expected.
+pub(crate) static WIDE_SURPRISES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether shader writes declared over much of a copy hold back title reads
+/// only where they were found (`VICTORY_WIDE_WRITES=0`: everywhere).
+fn wide_learned() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_WRITES").is_none_or(|v| v != "0"))
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1707,6 +1737,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            wide: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -1750,10 +1781,75 @@ impl Shadow {
         }
         let len = len.min(self.left(address));
         #[cfg(feature = "diagnostics")]
-        if len >= 4 << 20 {
+        if len >= WIDE as u64 {
             note_wide(self.span(), address, len);
         }
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Where a shader that declares `range` written is expected to write:
+    /// what title reads on the CPU must wait for. All of it, or, for a range
+    /// of 4 MiB and more of a copy in the card's memory, the pieces such
+    /// shaders were found to write so far, and one on each side.
+    ///
+    /// Seven of Grand Theft Auto VI's culling programs are bound all 174 MB
+    /// of the heap its CPU writes each frame's constants to, and write some
+    /// 24 KB of it, always in the same few pieces: every constant and copy
+    /// read from that heap meanwhile waited for the card, 40-60 ms a frame.
+    /// shortcut: a piece written for the first time may be read by the CPU
+    /// before it lands, once ([`WIDE_SURPRISES`] counts such pieces); only
+    /// title copies and constants, shaders read the copy itself.
+    pub(crate) fn expected_writes(&self, range: (usize, usize)) -> Vec<(usize, usize)> {
+        if range.1 - range.0 < WIDE || self.card.is_none() || !wide_learned() {
+            return vec![range];
+        }
+        let now = crate::frame::current() + 1;
+        let mut wide = self.wide.lock().unwrap_or_else(|e| e.into_inner());
+        if wide.since == 0 {
+            wide.since = now;
+        }
+        if now < wide.since + WIDE_FRAMES {
+            return vec![range];
+        }
+        let start = self.start as usize;
+        wide.pieces
+            .iter()
+            .map(|&p| (start + p.saturating_sub(1) * WIDE_PIECE, start + (p + 2) * WIDE_PIECE))
+            .map(|(a, b)| (a.max(range.0), b.min(range.1)))
+            .filter(|(a, b)| a < b)
+            .collect()
+    }
+
+    /// Shader writes were found in the copy at offsets `[at, at + gpu.len())`
+    /// (`gpu` against `held`, what it held): the pieces written outside the
+    /// narrow ranges are noted.
+    fn learn_wide(&self, at: usize, gpu: &[u8], held: &[u8]) {
+        if self.len < WIDE as u64 || !wide_learned() || self.wide.lock().unwrap_or_else(|e| e.into_inner()).since == 0 {
+            return;
+        }
+        let end = at + gpu.len();
+        let narrow: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending
+                .iter()
+                .filter(|r| r.1 - r.0 < WIDE)
+                .map(|r| self.inside(r.0, r.1 - r.0))
+                .filter(|&(a, b)| a < end && b > at)
+                .collect()
+        };
+        for (a, b) in outside(at, end, narrow) {
+            let mut a = a;
+            while a < b {
+                let to = ((a / WIDE_PIECE + 1) * WIDE_PIECE).min(b);
+                if gpu[a - at..to - at] != held[a - at..to - at] {
+                    let mut wide = self.wide.lock().unwrap_or_else(|e| e.into_inner());
+                    if wide.pieces.insert(a / WIDE_PIECE) && crate::frame::current() + 1 >= wide.since + WIDE_FRAMES {
+                        WIDE_SURPRISES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                a = to;
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2622,6 +2718,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        self.learn_wide(at, gpu, held);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -3208,12 +3305,12 @@ thread_local! {
 #[cfg(feature = "diagnostics")]
 type Wide = std::collections::BTreeMap<((u64, u64), String, &'static str), (u32, u64, u64)>;
 #[cfg(feature = "diagnostics")]
-static WIDE: Mutex<Wide> = Mutex::new(Wide::new());
+static WIDE_SEEN: Mutex<Wide> = Mutex::new(Wide::new());
 
 #[cfg(feature = "diagnostics")]
 fn note_wide(span: (u64, u64), address: u64, len: u64) {
     let (shader, how) = BINDING.with(|b| b.borrow().clone());
-    let mut wide = WIDE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wide = WIDE_SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if wide.len() < 4096 {
         let w = wide.entry((span, shader, how)).or_default();
         *w = (w.0 + 1, address, len);
@@ -3228,6 +3325,10 @@ static FOUND: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 /// The most frequent of them, for the frame line.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_wide(frames: f64) {
+    tracing::info!(
+        "shader writes declared wide: {} pieces were written that were not expected, since the start",
+        WIDE_SURPRISES.load(Ordering::Relaxed)
+    );
     let found = std::mem::take(&mut *FOUND.lock().unwrap_or_else(|e| e.into_inner()));
     let mut copies: Vec<u64> = found.iter().map(|f| f.0).collect();
     copies.sort_unstable();
@@ -3245,7 +3346,7 @@ pub(crate) fn log_wide(frames: f64) {
             mine.iter().step_by((mine.len() / 12).max(1)).take(12).collect::<Vec<_>>()
         );
     }
-    let wide = std::mem::take(&mut *WIDE.lock().unwrap_or_else(|e| e.into_inner()));
+    let wide = std::mem::take(&mut *WIDE_SEEN.lock().unwrap_or_else(|e| e.into_inner()));
     let mut wide: Vec<_> = wide.into_iter().collect();
     wide.sort_by_key(|w| std::cmp::Reverse((w.0.0.1, w.1.0)));
     for ((span, shader, how), (times, address, len)) in wide.into_iter().take(14) {
