@@ -2510,6 +2510,30 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     wait.met()
 }
 
+/// [`late_met`] without its settle: whether a bottom-of-pipe write of a
+/// flight in the air, or of one being landed, is known to meet `wait`.
+/// False says nothing about what else the flights may write there. (From
+/// fxceless/victory-gta6 3973179.)
+pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
+    let (address, bytes) = wait.place();
+    let line = line();
+    let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
+        Late::Write(at, what, n) => Some((at, what, n)),
+        _ => None,
+    }));
+    for (at, what, n) in writes {
+        if let crate::queue::Written::Value(v) = what
+            && *at == address
+            && *n >= bytes
+            && wait.holds_for(*v)
+        {
+            LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
@@ -4443,6 +4467,9 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        // Descriptors the title copied into placed heaps directly, before
+        // command lists that index those slots are submitted.
+        crate::descriptor::sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5497,6 +5524,16 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// Whether the list, once it has run, stores at `address` a value of
+    /// `bytes` bytes or more for which `holds` says yes (one of its
+    /// bottom-of-pipe writes, as [`late_met`] reads them of a flight).
+    pub(crate) fn will_write(&self, address: usize, bytes: usize, holds: impl Fn(u64) -> bool) -> bool {
+        self.deferred()
+            .writes
+            .iter()
+            .any(|(at, what, n)| *at == address && *n >= bytes && matches!(what, crate::queue::Written::Value(v) if holds(*v)))
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
     ///
@@ -6447,6 +6484,8 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        crate::descriptor::sync_line(frames);
+        crate::list::self_copies_line(frames);
         #[cfg(feature = "diagnostics")]
         {
             crate::watch::log_guard_parts(frames);

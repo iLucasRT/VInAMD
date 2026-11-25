@@ -26,6 +26,11 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// A fingerprint of the record each slot held when the pass over
+    /// records copied in as bytes last looked at it
+    /// ([`HostHeap::mirror_copied_page`]; 0: never looked at). Made on first
+    /// use.
+    copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -789,6 +794,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1464,6 +1470,71 @@ impl HostHeap {
         }
     }
 
+    /// For every record of one changed page of the title's heap
+    /// (`super::sync_heaps`: the title copies records into its heap as
+    /// bytes): [`HostHeap::mirror`], of those whose bytes are not the ones
+    /// this last saw there. `slots`: the title slots on the page, the record
+    /// of slot `i` at title address `start + i * step`, `page` the bytes read
+    /// from title address `from` on (through the kernel, which fails on a
+    /// page the title unmapped meanwhile). Returns the records looked at and
+    /// those mirrored.
+    ///
+    /// The page says only that something on it was written, and `mirror` by
+    /// itself would take every buffer or placed-texture record on it for
+    /// newly written each time. A slot draws read through a table lately is
+    /// left to its draws: the title writes its per-draw tables into the same
+    /// heap every frame, and each draw makes what its table shows in a slot
+    /// of its own (most of the records fxceless counted).
+    pub(crate) fn mirror_copied_page(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, u64) {
+        let frame = crate::frame::current();
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots {
+                let handle = start + index * step;
+                // A record that straddles the range's ends is left to the
+                // range that holds its first byte.
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page.get(at..at + step as usize) else {
+                    continue;
+                };
+                looked += 1;
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                // Never 0, which is "never looked at".
+                let print = record_print(record) | 1;
+                // The record last seen, or a slot never looked at that holds
+                // nothing: as it was.
+                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                    continue;
+                }
+                if self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                *last = print;
+                due.push((index as u32, handle));
+            }
+        }
+        for &(index, handle) in &due {
+            self.mirror(index, handle, false);
+        }
+        (looked, due.len() as u64)
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1726,6 +1797,28 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// Since the last frame line: slots on changed heap pages that
+/// [`HostHeap::mirror_copied_page`] left to their draws (tables' slots).
+pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
+/// equal records give equal prints, and two different records the same
+/// print about once in 2^64.
+fn record_print(record: &[u8]) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = K ^ record.len() as u64;
+    let mut words = record.chunks_exact(8);
+    for word in &mut words {
+        let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+        h = (h ^ w).wrapping_mul(K);
+        h ^= h >> 29;
+    }
+    for &b in words.remainder() {
+        h = (h ^ u64::from(b)).wrapping_mul(K);
+    }
+    h ^ (h >> 32)
 }
 
 /// The host resource a slot made by [`make`] views, if any.

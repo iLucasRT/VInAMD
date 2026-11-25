@@ -865,6 +865,47 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// Whether a copy between two title textures that share one host texture is
+/// left out (`VICTORY_SELF_COPY=1`: it is recorded, as before). The host
+/// does not allow a texture copied onto itself, and it would change nothing.
+/// After fxceless/victory-gta6 a253706 (triippywhale 6e502b3b).
+#[cfg(windows)]
+fn no_self_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SELF_COPY").is_none_or(|v| v != "1"))
+}
+
+/// Copies found between title textures that share one host texture, since
+/// the last frame line and since the start.
+#[cfg(windows)]
+static SELF_COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With the frame line: the copies of a texture onto itself.
+#[cfg(windows)]
+pub(crate) fn self_copies_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let lately = SELF_COPIES[0].swap(0, Relaxed);
+    if lately > 0 {
+        tracing::info!(
+            "copies of a texture onto itself: {:.2} per frame, {} since the start (VICTORY_SELF_COPY=1: recorded)",
+            lately as f64 / frames,
+            SELF_COPIES[1].load(Relaxed)
+        );
+    }
+}
+
+/// A copy between two title textures of one host texture: counted, and
+/// whether it is left out.
+#[cfg(windows)]
+fn self_copied(dst: This, src: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    SELF_COPIES[0].fetch_add(1, Relaxed);
+    if SELF_COPIES[1].fetch_add(1, Relaxed) == 0 {
+        tracing::info!(?dst, ?src, "a copy between two title textures that share one host texture: the first one");
+    }
+    no_self_copy()
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -886,9 +927,14 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            crate::texture::host_written(dst);
+            // Only the two state changes and the copy are left out: what is
+            // noted of the textures stays as it was.
+            if windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) && self_copied(dst, src) {
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -981,6 +1027,8 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        // Both sides are the same subresource of one host texture.
+        let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1009,18 +1057,27 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            same = texture.as_raw() == to.as_raw()
+                && dst.kind != FOOTPRINT
+                && src.footprint.offset as u32 == dst.footprint.offset as u32
+                && self_copied(dst.resource, src.resource);
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if !same {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
-        ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
+        if same {
+            return;
+        }
+        ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
