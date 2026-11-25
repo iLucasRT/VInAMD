@@ -538,6 +538,102 @@ pub(crate) fn near_heaps(va: u64) -> String {
         };
         text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        drop(ranges);
+        text.push_str(&slots_at(va));
+    }
+    text
+}
+
+/// The view heap slots last written through (diagnostics): where the heap is.
+#[cfg(feature = "diagnostics")]
+static VIEW_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// For device-removed reports (diagnostics): which slots of the view heap
+/// hold an address at or a little before `va`, as the card reads them.
+///
+/// The slots are read as GFX11 lays them out (32 bytes; an image's base is
+/// its address over 256 in 40 bits, a buffer's the address in 48), which only
+/// tells something on such a card. They are read as another process would,
+/// so that a heap that is no plain memory is not a fault of ours.
+#[cfg(feature = "diagnostics")]
+fn slots_at(va: u64) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let at = VIEW_HEAP.load(std::sync::atomic::Ordering::Acquire) as *const HostHeap;
+    // SAFETY: the heap a slot was last written in; titles keep theirs.
+    let Some(heap) = (unsafe { at.as_ref() }) else {
+        return String::new();
+    };
+    if heap.step != 32 {
+        return format!("; slots of {} bytes are not read", heap.step);
+    }
+    let total = heap.count as usize + heap.dynamic as usize;
+    let mut found: Vec<(u64, u32, [u32; 8], u64)> = Vec::new();
+    let (mut set, mut read) = (0u64, 0usize);
+    let mut chunk = vec![0u32; 8 * 32_768];
+    let mut first = 0usize;
+    while first < total {
+        let n = (total - first).min(32_768);
+        let mut got = 0usize;
+        // SAFETY: reads into our buffer; a bad source is reported, not a fault.
+        let done = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                (heap.cpu + first * 32) as *const _,
+                chunk.as_mut_ptr().cast(),
+                n * 32,
+                &mut got,
+            )
+        };
+        if done == 0 {
+            break;
+        }
+        for (i, w) in chunk[..8 * n].chunks_exact(8).enumerate() {
+            let w: [u32; 8] = w.try_into().unwrap_or_default();
+            let image = w[3] >> 28 >= 8;
+            let (base, bytes) = if image {
+                ((u64::from(w[0]) | u64::from(w[1] & 0xff) << 32) << 8, 0)
+            } else {
+                let stride = u64::from(w[1] >> 16 & 0x3fff).max(1);
+                (u64::from(w[0]) | u64::from(w[1] & 0xffff) << 32, u64::from(w[2]) * stride)
+            };
+            if base == 0 {
+                continue;
+            }
+            set += 1;
+            let near = if image { va >= base && va - base < 64 << 20 } else { va >= base && va - base < bytes.max(1 << 16) };
+            if near {
+                found.push((va - base, (first + i) as u32, w, bytes));
+            }
+        }
+        read += n;
+        first += n;
+    }
+    found.sort_by_key(|f| f.0);
+    let count = found.len();
+    let mut text = format!("; view heap slots read {read} of {total} (cpu {:#x}), {set} with an address, {count} of them at or before the fault", heap.cpu);
+    for (behind, slot, w, bytes) in found.into_iter().take(24) {
+        let kept = heap
+            .kept
+            .try_lock()
+            .ok()
+            .and_then(|k| k.get(slot as usize).cloned().flatten())
+            .map(|r| {
+                // SAFETY: a resource the slot holds.
+                let d = unsafe { r.GetDesc() };
+                format!("holds {}x{}x{} f{} dim {} {:#x}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.Dimension.0, windows::core::Interface::as_raw(&r) as usize)
+            });
+        let made = heap.made.try_lock().ok().and_then(|m| m.get(slot as usize).copied());
+        let taken = slot
+            .checked_sub(heap.count)
+            .map(|d| heap.next.try_lock().ok().and_then(|n| n.1.get(d as usize).copied()));
+        text.push_str(&format!(
+            "; slot {slot} +{behind:#x} (bytes {bytes:#x}) {w:08x?} {} made {made:x?} dynamic taken {taken:?}",
+            kept.as_deref().unwrap_or("holds nothing"),
+        ));
+    }
     text
 }
 
@@ -1224,6 +1320,10 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        #[cfg(feature = "diagnostics")]
+        if !self.sampler {
+            VIEW_HEAP.store(std::ptr::from_ref(self) as usize, std::sync::atomic::Ordering::Release);
+        }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
