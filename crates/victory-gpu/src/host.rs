@@ -5437,12 +5437,58 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The ranges asked of each copy, by its place in `refreshes`
+    /// (diagnostics: what joining them to one range adds).
+    #[cfg(feature = "diagnostics")]
+    asked: std::collections::HashMap<usize, Vec<(usize, usize)>>,
+}
+
+/// Since the last frame line (diagnostics): bytes of the one range a copy's
+/// pending refreshes are joined to, bytes of the ranges asked for (those
+/// closer than 64 KiB joined), and the ranges; each for copies asked for
+/// more than one such range.
+#[cfg(feature = "diagnostics")]
+static JOINED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// For the frame line: [`JOINED`], taken.
+#[cfg(feature = "diagnostics")]
+fn log_joined(frames: f64) {
+    let j = JOINED.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "refreshes joined to one range a copy, per frame: {:.0} copies {:.0} MB in all; {:.0} of them were asked for in {:.0} ranges apart, \
+         {:.0} MB",
+        j[0],
+        j[1] / 1e6,
+        j[2],
+        j[3],
+        j[4] / 1e6
+    );
+}
+
+/// Notes what a copy's pending refreshes were ([`JOINED`]).
+#[cfg(feature = "diagnostics")]
+fn note_joined(from: usize, to: usize, mut asked: Vec<(usize, usize)>) {
+    asked.sort_unstable();
+    let mut apart: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in asked {
+        match apart.last_mut() {
+            Some(last) if a <= last.1 + (64 << 10) => last.1 = last.1.max(b),
+            _ => apart.push((a, b)),
+        }
+    }
+    JOINED[0].fetch_add(1, Ordering::Relaxed);
+    JOINED[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+    JOINED[2].fetch_add(u64::from(apart.len() > 1), Ordering::Relaxed);
+    JOINED[3].fetch_add(if apart.len() > 1 { apart.len() as u64 } else { 0 }, Ordering::Relaxed);
+    JOINED[4].fetch_add(apart.iter().map(|r| (r.1 - r.0) as u64).sum(), Ordering::Relaxed);
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        #[cfg(feature = "diagnostics")]
+        self.asked.entry(key).or_default().push((address, end));
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -5465,6 +5511,10 @@ impl Batch {
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(asked) = self.asked.remove(&(std::sync::Arc::as_ptr(&shadow) as usize)) {
+            note_joined(from, to, asked);
         }
         Self::update(&shadow, from, to);
     }
@@ -5495,6 +5545,12 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        #[cfg(feature = "diagnostics")]
+        for (shadow, from, to) in &self.refreshes {
+            if let Some(asked) = self.asked.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+                note_joined(*from, *to, asked);
+            }
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -6007,7 +6063,10 @@ impl Meter {
         );
         late_line(frames);
         #[cfg(feature = "diagnostics")]
-        crate::watch::log_guard_parts(frames);
+        {
+            crate::watch::log_guard_parts(frames);
+            log_joined(frames);
+        }
         let gpu_busy = card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
