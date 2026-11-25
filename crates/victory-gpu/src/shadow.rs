@@ -2797,6 +2797,9 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let whole = crate::watch::wholly_clean();
+                // Answered ahead: the stamp is the answer's. (One read here,
+                // after it, would hold writes the answer has not.)
+                let stamp = crate::watch::answer_stamp().unwrap_or(stamp);
                 if same && !whole && crate::watch::stamp(from, to) == stamp {
                     STAMPED_CLEAN[1].fetch_add(1, Ordering::Relaxed);
                 }

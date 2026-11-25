@@ -305,11 +305,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     WHOLLY_CLEAN.set(false);
+    ANSWER_STAMP.set(None);
     if guarded
         && batch()
         && let Some(answer) = ANSWERS.read().unwrap_or_else(|e| e.into_inner()).get(&(first, last))
     {
         WHOLLY_CLEAN.set(answer.clean);
+        ANSWER_STAMP.set(Some(answer.stamp));
         return Some((answer.now, answer.written.clone()));
     }
     // View memory, known by a guard of ours: not the kernel's to answer.
@@ -722,6 +724,9 @@ struct Answer {
     now: u64,
     written: Vec<(usize, u64)>,
     clean: bool,
+    /// The stamp of the range when it was answered: a write since then is
+    /// not in the answer, and must not be in the stamp it is kept under.
+    stamp: Option<u64>,
 }
 
 /// By first and last page, until [`answered`].
@@ -762,7 +767,14 @@ pub(crate) fn answer_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     install();
-    let found: Vec<(Vec<usize>, bool)> = pages.iter().map(|&(first, last)| guard_held(&mut held, first, last)).collect();
+    let found: Vec<(Vec<usize>, bool, Option<u64>)> = pages
+        .iter()
+        .map(|&(first, last)| {
+            let stamp = stamp(first * PAGE, last * PAGE);
+            let (written, clean) = guard_held(&mut held, first, last);
+            (written, clean, stamp)
+        })
+        .collect();
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -780,9 +792,9 @@ pub(crate) fn answer_ahead(ranges: &[(usize, usize)]) {
     // (Held until the journal has what they said: see `guarded_writes`.)
     drop(held);
     let mut answers = ANSWERS.write().unwrap_or_else(|e| e.into_inner());
-    for (&(first, last), (_, clean)) in pages.iter().zip(&found) {
+    for (&(first, last), (_, clean, stamp)) in pages.iter().zip(&found) {
         let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
-        answers.insert((first, last), Answer { now, written, clean: *clean });
+        answers.insert((first, last), Answer { now, written, clean: *clean, stamp: *stamp });
     }
 }
 
@@ -1033,6 +1045,13 @@ thread_local! {
     /// Whether this thread's last [`writes`] found the range wholly clean,
     /// by the guards.
     static WHOLLY_CLEAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// If it was answered ahead: the stamp from then.
+    static ANSWER_STAMP: std::cell::Cell<Option<Option<u64>>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`ANSWER_STAMP`].
+pub(crate) fn answer_stamp() -> Option<Option<u64>> {
+    ANSWER_STAMP.get()
 }
 
 /// [`WHOLLY_CLEAN`].

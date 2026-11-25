@@ -238,6 +238,8 @@ pub(crate) fn barrier_test() -> u8 {
         Ok("groups") => 1,
         Ok("indirect") => 2,
         Ok("both") => 3,
+        // `double`: the clamp of an indirect command is recorded twice.
+        Ok("double") => 4,
         _ => 0,
     })
 }

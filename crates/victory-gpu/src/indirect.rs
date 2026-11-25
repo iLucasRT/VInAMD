@@ -373,6 +373,29 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // Diagnostics: `VICTORY_BARRIER_TEST=double` records the clamp twice, to
+    // see what one costs by what it adds (leaving the waits out says nothing
+    // of the state changes, which wait too).
+    #[cfg(feature = "diagnostics")]
+    let twice = crate::copystat::barrier_test() & 4 != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let twice = false;
+    if twice && records > 0 {
+        // SAFETY: as below.
+        unsafe {
+            l.ResourceBarrier(&first);
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, src_gpu);
+            l.SetComputeRootShaderResourceView(2, count_gpu);
+            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+            l.SetComputeRootUnorderedAccessView(4, budget);
+            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.ResourceBarrier(&second);
+            l.ResourceBarrier(&[transition(dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+    }
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
