@@ -10,11 +10,16 @@ cell, Lucia standing still, the last 60 s of a 330 s run.
 | frame | 213-218 ms | 167 ms (6 fps) |
 | submitting thread, preparing | 125 ms | 115 ms |
 | of that, copying memory | 75 ms | 73 ms |
-| GPU | 77 ms | 35 ms |
+| our threads waiting for the GPU | 77 ms | 35 ms |
+| GPU with work queued (busy) | ~115 ms (53 %) | ~93 ms (56 %) |
 | read-back thread (in parallel) | 104 ms | 94 ms |
 
+(Earlier notes called the wait "GPU time". It is not: the card had work queued for
+more than half of the frame. "Busy" counts work queued, so it is an upper bound of
+what the card needs, and part of it is our own hash and compare passes.)
+
 AD1 is a single run (AD0, cold: 180 ms). The limit is the CPU, on the submitting
-thread. AD1's numbers per frame, summed over threads: 13,554 title copies for only
+thread: of the ~81 ms the card stands idle, ~46 are while that thread works. AD1's numbers per frame, summed over threads: 13,554 title copies for only
 6.6 MB (35 ms of kernel calls); 2,447 "what changed?" askings over 9.0 GB, 98 %
 unchanged (69 ms); 107 ms of the read-back thread, 40 of them waiting for its own
 copies.
@@ -112,9 +117,10 @@ copies.
   shows it if that thread is the limit, so it comes after 2 and 3.
 
 ### 5. AMD FSR (klbf-lab `ffx.rs`)
-- Only if the GPU becomes the limit after 1-4 (today 35 of 167 ms). New files, but it
-  needs the FidelityFX library, loaded from a folder.
-- Effort: medium. Expected today: almost nothing.
+- Only if the GPU becomes the limit after 1-4. Busy ~93 of 167 ms today, so this may
+  come sooner than thought: below some 100 ms a frame the card would start to count.
+  New files, but it needs the FidelityFX library, loaded from a folder.
+- Effort: medium. Expected today: little, the CPU is the limit.
 
 ### 6. A single mirror of the title's memory (an idea of xcl's, long term)
 - xcl does not have thousands of copies: it mirrors the title's addresses in a few 4 GB
