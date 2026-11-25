@@ -102,6 +102,22 @@ const WIDE_FRAMES: u64 = 90;
 /// Pieces found written after [`WIDE_FRAMES`], which were not expected.
 pub(crate) static WIDE_SURPRISES: AtomicU64 = AtomicU64::new(0);
 
+/// Since the last frame line: bytes of pages the title wrote that were
+/// looked through for what changed, and those that had.
+pub(crate) static DIFFED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a refresh stores, and sends to the card, only the 4 KiB pages
+/// that hold other bytes than the copy (`VICTORY_DIFF_COPY=0`: all of every
+/// 64 KiB page the title wrote to).
+///
+/// The host tells writes by the 4 KiB page and the guards by 64 KiB, and
+/// either way what a page is written with may be what it held: whole 64 KiB
+/// pages went to the copy, up to the card, and through our hashes there.
+fn diff_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIFF_COPY").is_none_or(|v| v != "0"))
+}
+
 /// Whether shader writes declared over much of a copy hold back title reads
 /// only where they were found (`VICTORY_WIDE_WRITES=0`: everywhere).
 fn wide_learned() -> bool {
@@ -2534,7 +2550,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy(from, to, true);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -2547,7 +2563,9 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // The run of pages being gathered: its first, and whether it was
+        // never copied.
+        let (mut bytes, mut run) = (0, None::<(usize, bool)>);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2559,30 +2577,62 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let fresh = *at == 0;
+                if let Some((first, was)) = run
+                    && was != fresh
+                {
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), was);
+                    run = None;
+                }
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                run.get_or_insert((page, fresh));
+            } else if let Some((first, fresh)) = run.take() {
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), fresh);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        if let Some((first, fresh)) = run {
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to), fresh);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// `fresh`: some of it was never copied, so the copy may never have had
+    /// what its CPU side holds.
+    ///
+    /// Otherwise only the 4 KiB pages that hold other bytes than the copy
+    /// are stored, and only they count as changed ([`diff_copies`]).
+    fn copy(&self, from: usize, to: usize, fresh: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        if !fresh && from < to && diff_copies() {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let whole = crate::usercopy::copy_changed(from as *const u8, at, to - from, |offset, n| {
+                match runs.last_mut() {
+                    Some(last) if last.1 == offset => last.1 += n,
+                    _ => runs.push((offset, offset + n)),
+                }
+            });
+            let changed: usize = runs.iter().map(|r| r.1 - r.0).sum();
+            for (a, b) in runs {
+                self.changed(from - start + a, from - start + b);
+                self.card_changed(from - start + a, from - start + b);
+            }
+            if whole == Some(true) {
+                DIFFED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+                DIFFED[1].fetch_add(changed as u64, Ordering::Relaxed);
+                return to - from;
+            }
+            // Switched off, or a page is not there: as before.
+        }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
@@ -3355,6 +3405,8 @@ static FOUND: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
 /// The most frequent of them, for the frame line.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_wide(frames: f64) {
+    let [looked, changed] = [0, 1].map(|i| DIFFED[i].swap(0, Ordering::Relaxed) as f64 / frames / 1e6);
+    tracing::info!("refreshes by difference: {looked:.1} MB a frame looked through, {changed:.1} MB of it had changed");
     tracing::info!(
         "shader writes declared wide: {} pieces were written that were not expected, since the start",
         WIDE_SURPRISES.load(Ordering::Relaxed)

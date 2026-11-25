@@ -166,9 +166,45 @@ pub(crate) fn copy(src: *const u8, dst: *mut u8, len: usize) -> Option<bool> {
     Some(failed as u32 == 0)
 }
 
+/// The host's page: what [`copy_changed`] compares at a time.
+const CHUNK: usize = 4096;
+
+/// [`copy`] of what differs: each 4 KiB page of `[src, src + len)` (cut at
+/// its ends) is read once and stored only if `dst` holds other bytes;
+/// `each` is told the offset and bytes of those. `Some(false)` if a page is
+/// not there (what came before it is done and told), `None` as for `copy`.
+pub(crate) fn copy_changed(
+    src: *const u8,
+    dst: *mut u8,
+    len: usize,
+    mut each: impl FnMut(usize, usize),
+) -> Option<bool> {
+    if !on() {
+        return None;
+    }
+    let mut page = [0u8; CHUNK];
+    let mut at = 0;
+    while at < len {
+        let from = src.wrapping_add(at);
+        let n = (CHUNK - from as usize % CHUNK).min(len - at);
+        if !copy(from, page.as_mut_ptr(), n)? {
+            return Some(false);
+        }
+        // SAFETY: the caller's destination, `len` bytes of host memory
+        // nothing else writes meanwhile.
+        let held = unsafe { std::slice::from_raw_parts_mut(dst.add(at), n) };
+        if *held != page[..n] {
+            held.copy_from_slice(&page[..n]);
+            each(at, n);
+        }
+        at += n;
+    }
+    Some(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::copy;
+    use super::{copy, copy_changed};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         VirtualProtect,
@@ -233,6 +269,39 @@ mod tests {
         // SAFETY: a committed page of ours.
         assert_ne!(unsafe { VirtualProtect(hole.cast(), PAGE, PAGE_READONLY, &mut old) }, 0);
         assert_eq!(copy(to.as_ptr(), hole, 100), Some(false));
+        release(hole);
+    }
+
+    /// Only the pages that differ are stored and told, the last one cut.
+    #[test]
+    fn only_pages_that_differ_are_stored() {
+        let mut from = vec![7u8; 5 * PAGE + 100];
+        let mut to = from.clone();
+        // Two pages of the source, by its own addresses, and its last bytes.
+        let start = from.as_ptr() as usize;
+        let page = |k: usize| k * PAGE - start % PAGE;
+        from[page(2) + 5] = 1;
+        from[page(3)] = 2;
+        let last = from.len() - 1;
+        from[last] = 3;
+        let mut told = Vec::new();
+        if copy_changed(from.as_ptr(), to.as_mut_ptr(), from.len(), |at, n| told.push((at, n))) != Some(true) {
+            return;
+        }
+        assert_eq!(to, from);
+        assert_eq!(told[..2], [(page(2), PAGE), (page(3), PAGE)]);
+        assert_eq!(told.len(), 3);
+        assert_eq!(told[2].0 + told[2].1, from.len());
+        told.clear();
+        assert_eq!(copy_changed(from.as_ptr(), to.as_mut_ptr(), from.len(), |at, n| told.push((at, n))), Some(true));
+        assert!(told.is_empty(), "nothing differs any more");
+        // A hole is told, what came before it is done.
+        let hole = holed();
+        // SAFETY: the first page is committed.
+        unsafe { hole.write(9) };
+        let mut to = vec![0u8; 3 * PAGE];
+        assert_eq!(copy_changed(hole, to.as_mut_ptr(), 3 * PAGE, |at, n| told.push((at, n))), Some(false));
+        assert_eq!((told.as_slice(), to[0]), ([(0, PAGE)].as_slice(), 9));
         release(hole);
     }
 
