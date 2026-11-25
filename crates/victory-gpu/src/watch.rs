@@ -1284,6 +1284,26 @@ fn install() {
     });
 }
 
+/// Since the last frame line (diagnostics): how often each block was opened
+/// by a fault.
+#[cfg(feature = "diagnostics")]
+static FAULTED: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
+
+/// For the frame line: the faults, the blocks they were in, those in blocks
+/// that fault in most frames, and the blocks that do.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_faulted(frames: f64) {
+    let faulted = std::mem::take(&mut *FAULTED.lock().unwrap_or_else(|e| e.into_inner()));
+    let hot: Vec<u32> = faulted.values().copied().filter(|&n| f64::from(n) >= frames * 0.75).collect();
+    tracing::info!(
+        "write faults into guarded blocks per frame: {:.0}, in {} blocks; {} of the blocks fault in most frames and take {:.0} of them",
+        faulted.values().map(|&n| f64::from(n)).sum::<f64>() / frames,
+        faulted.len(),
+        hot.len(),
+        hot.iter().map(|&n| f64::from(n)).sum::<f64>() / frames
+    );
+}
+
 /// A write to `at` faulted: whether it may be tried again (the block was
 /// guarded and is open now, or is writable after all).
 pub(crate) fn write_faulted(at: usize) -> bool {
@@ -1294,6 +1314,10 @@ pub(crate) fn write_faulted(at: usize) -> bool {
     if open(&mut g, at, at + 1) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        #[cfg(feature = "diagnostics")]
+        {
+            *FAULTED.lock().unwrap_or_else(|e| e.into_inner()).entry(at / BLOCK).or_default() += 1;
+        }
         return true;
     }
     writable(at)

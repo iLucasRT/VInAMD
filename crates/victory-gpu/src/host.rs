@@ -1283,6 +1283,116 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
+/// With `VICTORY_CARD_TIMING=1` (diagnostics): our passes' time on the card.
+/// Microseconds of the lists before submissions (copies sent up and hash
+/// passes), of those after them (compare passes), from the one's start to
+/// the other's end for submissions with both (the title's lists are in
+/// between), of our two in those; and the submissions with both.
+#[cfg(feature = "diagnostics")]
+static CARD_GPU: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The two stamps of a list of ours, by the list.
+#[cfg(feature = "diagnostics")]
+static CARD_STAMPS: Mutex<std::collections::BTreeMap<usize, (ID3D12QueryHeap, ID3D12Resource)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(feature = "diagnostics")]
+fn card_timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_TIMING").is_some_and(|v| v == "1"))
+}
+
+/// For the frame line.
+#[cfg(feature = "diagnostics")]
+fn log_card_timing(frames: f64) {
+    if !card_timing() {
+        return;
+    }
+    let c = CARD_GPU.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "our passes' time on the card per frame: {:.1} ms before submissions (copies up, hashes), {:.1} ms after them (compares); of {:.1} \
+         submissions with both {:.1} ms from start to end, {:.1} ms of it ours",
+        c[0] / 1e3,
+        c[1] / 1e3,
+        c[4],
+        c[2] / 1e3,
+        c[3] / 1e3
+    );
+}
+
+#[cfg(feature = "diagnostics")]
+impl Host {
+    /// The stamps of a list of ours, made at first.
+    fn card_stamps(&self, list: &ID3D12GraphicsCommandList) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+        if !card_timing() {
+            return None;
+        }
+        let key = windows::core::Interface::as_raw(list) as usize;
+        let mut all = CARD_STAMPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stamps) = all.get(&key) {
+            return Some(stamps.clone());
+        }
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: plain object creation.
+        unsafe {
+            self.device
+                .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut heap)
+                .ok()?;
+        }
+        let stamps = (heap?, self.read_back_buffer(256)?);
+        all.insert(key, stamps.clone());
+        Some(stamps)
+    }
+
+    /// Records stamp `i` of `list` (0: its first command, 1: its last).
+    fn card_stamp(&self, list: &ID3D12GraphicsCommandList, i: u32) {
+        let Some((heap, back)) = self.card_stamps(list) else {
+            return;
+        };
+        // SAFETY: an open list, our heap and read-back buffer.
+        unsafe {
+            list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+            if i == 1 {
+                list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+            }
+        }
+    }
+
+    /// Adds up the stamps of a plan whose submission has run.
+    fn card_time(&self, lists: &[(bool, Prelude)]) {
+        if !card_timing() {
+            return;
+        }
+        // SAFETY: our queue.
+        let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1).max(1) as f64;
+        let read = |wanted: bool| -> Option<[u64; 2]> {
+            let (_, (_, list)) = lists.iter().find(|l| l.0 == wanted)?;
+            let (_, back) = self.card_stamps(list)?;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a read-back buffer the finished list resolved into.
+            unsafe {
+                back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut data)).ok()?;
+                let stamps = data.cast::<[u64; 2]>().read();
+                back.Unmap(0, None);
+                Some(stamps)
+            }
+        };
+        let us = |ticks: u64| (ticks as f64 * 1e6 / frequency) as u64;
+        let (before, after) = (read(false), read(true));
+        let add = |i: usize, n: u64| {
+            CARD_GPU[i].fetch_add(n, Ordering::Relaxed);
+        };
+        let time = |s: Option<[u64; 2]>| s.map_or(0, |s| us(s[1].saturating_sub(s[0])));
+        add(0, time(before));
+        add(1, time(after));
+        if let (Some(b), Some(a)) = (before, after) {
+            add(2, us(a[1].saturating_sub(b[0])));
+            add(3, time(before) + time(after));
+            add(4, 1);
+        }
+    }
+}
+
 /// One in [`ALIVE`]`[0]` while it lives (a host list), and one in
 /// [`LISTS`]`[3]` until it is first reset.
 struct Counted {
@@ -3271,6 +3381,8 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    self.card_stamp(list, 0);
                     if masks.is_some() {
                         // What the flights' shaders wrote, first.
                         list.ResourceBarrier(&[uav_barrier()]);
@@ -3351,6 +3463,8 @@ impl Host {
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    self.card_stamp(list, 1);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3417,6 +3531,8 @@ impl Host {
                     list.Reset(allocator, None)?;
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[uav_barrier()]);
+                    #[cfg(feature = "diagnostics")]
+                    self.card_stamp(list, 0);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -3431,6 +3547,8 @@ impl Host {
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    self.card_stamp(list, 1);
                     list.Close()?;
                     list.cast()
                 })()
@@ -3461,6 +3579,8 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        #[cfg(feature = "diagnostics")]
+        self.card_time(&plan.lists);
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -6141,6 +6261,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             crate::watch::log_guard_parts(frames);
+            crate::watch::log_faulted(frames);
             let [behind, not] = [0, 1].map(|i| crate::watch::PUTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let [spared, wrong] = [0, 1].map(|i| crate::shadow::STAMPED_CLEAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
@@ -6148,6 +6269,7 @@ impl Meter {
                  of them found wrong {wrong:.2} (VICTORY_CLEAN_STAMPS=check counts)"
             );
             log_joined(frames);
+            log_card_timing(frames);
             crate::ahead::log(frames);
             let r = crate::list::RECYCLE.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
