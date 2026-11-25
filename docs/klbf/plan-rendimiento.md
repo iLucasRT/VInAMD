@@ -50,30 +50,44 @@ propias copias.
   lanzador `play-amd.ps1` sin DRED.
 - Esfuerzo: bajo. Esperado: 10-25 ms quieta; más al moverse.
 
-### 2. Copias chicas sin pasar por el núcleo
-- Hoy cada una de las ~13.500 copias cuesta ~2,5 µs en `ReadProcessMemory`
-  (`host.rs` `copy_mapped`, `read`). Copiar 500 bytes directo cuesta menos de 0,1 µs.
-- Cómo: con el bloqueo por rango de la etapa 1 (`title_memory_reading(at, len)`)
-  la memoria no puede desmapearse mientras se lee. Se guarda, por bloque de 64 KiB,
-  que está mapeado; `title_memory_remapped` lo invalida. Si el bloque es conocido:
-  `memcpy`; si no, el camino actual. Solo para origen del juego y hasta 64 KiB.
-- Archivos: `host.rs`, `watch.rs`. Test: remapear mientras otro hilo copia.
-- Riesgo: un fallo de acceso si una liberación no pasa por nuestros avisos. Por eso
-  solo bloques de vistas mapeadas por la capa, y el resto por el núcleo.
-- Esfuerzo: medio. Esperado: 15-25 ms del hilo que envía.
+### 2. Copias sin pasar por el núcleo (hecha, en medición como AF)
+- `usercopy.rs`: una rutina propia copia en el lugar; si una página no está, un
+  manejador la manda a su salida de error y se sigue por el camino del núcleo.
+  Sirve para cualquier tamaño, en los dos sentidos. `VICTORY_USER_COPY=0` la apaga.
+- AF1/AF3 con, AF2/AF4 sin.
 
-### 3. Preguntar menos qué cambió
+### 2b. Memoria compartida, parcial (en medición como AG)
+- `VICTORY_INPLACE=1`: la memoria privada del juego se abre como memoria de la placa
+  y deja de copiarse. Ya estaba en la base, apagado. El nivel 2 no va con los envíos
+  adelantados. Además bajaría la memoria comprometida.
+- Riesgo: el juego no puede liberar ni proteger esa memoria mientras está abierta.
+
+### 2c. Barrido de texturas ociosas por cola (idea de xcl, PR 490 de allá)
+- `resource.rs` `let_go_idle` recorre las ~67.000 texturas en cada barrido y le
+  cuesta al hilo que envía ~3 % (perfil P0). Con una cola de "quedó libre a tal
+  hora", ordenada, se miran solo las vencidas.
+- Esfuerzo: bajo. Esperado: 3-5 ms.
+
+### 3. Preguntar menos qué cambió, y copiar menos
 - 9,0 GB revisados por cuadro para encontrar 0,18 GB. Un bloque de 174 MB se revisa
   ~14 veces por cuadro.
-- Cómo: (a) preguntar una vez por envío por región y responder desde el diario a
-  todos los refrescos del envío; (b) para memoria vigilada por protección, cambiar
-  los conjuntos ordenados (`clean`, `protected`) por mapas de bits por región, así
-  "nada cambió" se contesta en microsegundos; (c) no volver a preguntar por un rango
-  que nadie escribió desde el envío anterior (contador de fallos de guardia).
+- Cómo:
+  a. **Granularidad de 4 KB (idea de xcl).** Windows informa escrituras por páginas
+     de 4 KB, pero nuestro diario las redondea a 64 KB y copia las 64. Primero medir:
+     cuántos de los ~190 MB copiados por cuadro cambiaron de verdad, a 4 KB y por tipo
+     de memoria. Si es poco, el diario pasa a 4 KB para la memoria vigilada por Windows.
+  b. **Huella por página enviada (idea de xcl).** Si una página se reescribió con lo
+     mismo, no se vuelve a mandar a la placa.
+  c. Memoria vigilada por protección: un sello por región que sube cada vez que se
+     abre un bloque o cambia un mapeo. Un rango sin sellos nuevos se contesta sin
+     preguntar. Los conjuntos ordenados (`clean`, `protected`) pasan a mapas de bits.
+  d. Una sola pregunta por región y por envío, y ninguna `VirtualQuery` en el camino
+     caliente: xcl midió 75-80 ms por llamada en una reserva de 4 GB, con el espacio
+     de direcciones bloqueado para todos.
 - Archivos: `watch.rs`, `shadow.rs` (`update_free`, `merge_under_writes`).
 - Riesgo: un aviso perdido deja datos viejos. Modo de control: un interruptor que
   pregunta igual y cuenta diferencias; tiene que dar 0 antes de activarlo.
-- Esfuerzo: medio. Esperado: 15-30 ms.
+- Esfuerzo: medio. Esperado: 15-30 ms, o más si (a) da.
 
 ### 4. Sombreadores que marcan lo que escriben (VIctory `cd94d35` + `940d32f`)
 - Qué saca: los pases que recalculan y comparan ~2.000 pedazos por cuadro en la
@@ -99,9 +113,19 @@ propias copias.
   nuevos, pero depende de la biblioteca FidelityFX que se carga de una carpeta.
 - Esfuerzo: medio. Esperado hoy: casi nada.
 
+### 6. Un solo espejo de la memoria del juego (idea de xcl, de fondo)
+- xcl no tiene miles de copias: refleja las direcciones del juego en pocas ventanas de
+  4 GB en la VRAM (recursos en mosaicos), pregunta qué cambió una vez por envío para
+  todo, y sube solo las páginas tocadas con un anillo de 64 MB que no espera.
+  Nosotros tenemos ~4.500 copias y 829 ventanas que se superponen.
+- Es rehacer `shadow.rs`, los sombreadores que leen por dirección y la vuelta. Solo
+  si después de 1-4 el límite sigue en las copias. Esfuerzo: muy alto.
+- **Solo ideas:** xcl es GPL-2.0 únicamente y nosotros GPL-3.0 o posterior. No se
+  copia código.
+
 ## Orden y puntos de decisión
 
-1 → 2 → 3 → perfilar de nuevo → 4 → 5.
+1 → 2 → 2b → perfilar → 2c → 3 (a primero) → perfilar → 4 → 5 → 6.
 
 - Después de 1: si AE no mejora, decidir por pares qué piezas se quedan.
 - Después de 3: con un perfil nuevo. Si el límite sigue en el hilo que envía, seguir
