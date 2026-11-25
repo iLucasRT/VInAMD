@@ -783,6 +783,17 @@ impl Staging {
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
+    /// [`Staging::refresh`] on a thread no submission waits for
+    /// (`crate::ahead`).
+    pub(crate) fn refresh_ahead(&self) {
+        self.refresh_now();
+    }
+
+    /// The staging buffer's bytes.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
@@ -1153,10 +1164,32 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
+    staged_or_made(resource, texture).map(|made| made.0)
+}
+
+/// For a texture made ready ahead (`crate::ahead`): as [`staging`], and
+/// whether it was made now; `None` for one whose contents are the host's.
+pub(crate) fn make_staging(resource: This, texture: &ID3D12Resource) -> Option<(Arc<Staging>, bool)> {
+    let host_written = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)));
+    if host_written || !title_written(texture) {
+        return None;
+    }
+    staged_or_made(resource, texture)
+}
+
+/// [`staging`], and whether it was made now. Made outside the lock: every
+/// recording thread's uploads ask here.
+fn staged_or_made(resource: This, texture: &ID3D12Resource) -> Option<(Arc<Staging>, bool)> {
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(s) = map.get(&(resource as usize)) {
+            return Some((s.clone(), false));
+        }
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1221,8 +1254,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
-    map.insert(resource as usize, s.clone());
-    Some(s)
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    match map.get_or_insert_with(HashMap::new).entry(resource as usize) {
+        // Another thread made it meanwhile: that one.
+        std::collections::hash_map::Entry::Occupied(there) => Some((there.get().clone(), false)),
+        std::collections::hash_map::Entry::Vacant(place) => Some((place.insert(s).clone(), true)),
+    }
 }
 
 #[cfg(test)]

@@ -57,6 +57,18 @@ const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
 
+/// The time of a frame's uploads of textures picked by index while at most
+/// 4,000 slots are due (`VICTORY_HEAP_TEXTURES_SMOOTH_MS`, unset: as with
+/// more, `VICTORY_HEAP_TEXTURES_MS`). What does not fit waits for the next
+/// frames, and shows up some frames later.
+fn smooth() -> Option<std::time::Duration> {
+    static MOST: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let ms = std::env::var("VICTORY_HEAP_TEXTURES_SMOOTH_MS").ok()?.trim().parse().ok()?;
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
 thread_local! {
     /// While a draw is prepared (`State::bind`, then its targets' states):
     /// the depth target the draw only tests (0: none, or one it writes),
@@ -1590,6 +1602,9 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
             TOOK.store(0, Ordering::Relaxed);
+            if crate::ahead::on() {
+                crate::ahead::sweep(frame);
+            }
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -1657,7 +1672,16 @@ impl State {
                 SPENT.load(Ordering::Relaxed).saturating_add(bytes),
                 std::time::Duration::ZERO,
             ),
-            None => (span, per_frame, std::time::Duration::from_micros(TOOK.load(Ordering::Relaxed))),
+            None => {
+                // In play (a few due, not a world's worth) a shorter time:
+                // the camera turning made some 1,000 slots due at once, and
+                // a frame that served them all took 300-700 ms.
+                let span = match smooth() {
+                    Some(most) if census[1] <= 4000 => span.min(most),
+                    _ => span,
+                };
+                (span, per_frame, std::time::Duration::from_micros(TOOK.load(Ordering::Relaxed)))
+            }
         };
         let began = Took(std::time::Instant::now());
         for (index, write) in due {
@@ -1676,8 +1700,18 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             let mut partly = None;
+            // Made ready by threads of their own, if any (`crate::ahead`);
+            // not for a run made early, whose draws need them now.
+            let mut ahead = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if PASS_BUDGET.get().is_none() && crate::ahead::on() {
+                    let key = (address, resource);
+                    if crate::ahead::waiting(&key) {
+                        continue;
+                    }
+                    ahead = Some(key);
+                }
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
@@ -1719,6 +1753,24 @@ impl State {
                 }
                 continue;
             }
+            let mut ours = false;
+            if let Some(key) = ahead {
+                // (One that another slot had uploaded is not made again.)
+                let there = partly.unwrap_or(u64::MAX);
+                let again = host.texture_slot_written(index, write).is_some_and(|written| {
+                    crate::resource::texture_at(key.0, &key.1)
+                        .is_some_and(|r| !crate::texture::is_staged(r) && crate::texture::picked_since(r as usize, written, there))
+                });
+                if !again {
+                    match crate::ahead::ask(&key) {
+                        crate::ahead::Answer::Wait => continue,
+                        crate::ahead::Answer::Go { ours: made } => {
+                            ours = made;
+                            crate::ahead::used(&key);
+                        }
+                    }
+                }
+            }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -1737,7 +1789,7 @@ impl State {
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
-            let tabled = crate::texture::is_staged(resource);
+            let tabled = crate::texture::is_staged(resource) && !ours;
             // Another slot of the same texture had it uploaded since.
             let there = partly.unwrap_or(u64::MAX);
             if !tabled

@@ -6148,6 +6148,7 @@ impl Meter {
                  of them found wrong {wrong:.2} (VICTORY_CLEAN_STAMPS=check counts)"
             );
             log_joined(frames);
+            crate::ahead::log(frames);
             let r = crate::list::RECYCLE.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
                 "lists that have run, per frame: {:.1} ms resetting them, {:.1} ms of it on threads that submit; {:.0} lists, {:.1} destroyed \
