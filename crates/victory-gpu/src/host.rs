@@ -9003,6 +9003,11 @@ fn slow_frame_ms() -> f64 {
 /// back (us); the card idle (us); the heap pass looking at slots, spans and
 /// textures (ns); draws.
 fn slow_counters() -> [u64; 10] {
+    // (The heap pass is timed in diagnostics builds only.)
+    #[cfg(feature = "diagnostics")]
+    let heap_split = |i: usize| crate::draw::HEAP_SPLIT[i].load(Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let heap_split = |_: usize| 0u64;
     let l = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
     [
         l(&SUBMISSION_US[0]),
@@ -9011,9 +9016,9 @@ fn slow_counters() -> [u64; 10] {
         l(&PREPARING[2]),
         l(&COPY_BACK[0]),
         l(&CARD_CLOCK_US[0]),
-        l(&crate::draw::HEAP_SPLIT[0]),
-        l(&crate::draw::HEAP_SPLIT[1]),
-        l(&crate::draw::HEAP_SPLIT[2]),
+        heap_split(0),
+        heap_split(1),
+        heap_split(2),
         crate::draw::drawn(),
     ]
 }
