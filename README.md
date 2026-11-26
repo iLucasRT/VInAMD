@@ -16,8 +16,8 @@ diagnostics build, `scripts\play.ps1`'s settings, shaders translated and pipelin
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| Open world and city, played | median 72 ms a frame (about 14 fps); one frame in ten over 94 ms |
-| Stutters | 19 % of seconds have a frame over 150 ms, 1 % over 250 ms |
+| Open world and city, played | median 68-74 ms a frame (about 14 fps); one frame in ten over 88-95 ms |
+| Stutters | 2-5 % of seconds have a frame over 250 ms |
 | Looking at the ground (few draws) | about 43 ms a frame (21-23 fps) |
 | Longest session played | 32 minutes; 17 minutes with these settings, no device loss |
 | Memory | about 40 GB of private memory; video memory held near 80 % of its budget: **64 GB of RAM needed** |
@@ -35,7 +35,8 @@ What is known to be wrong:
   frame for a while (`VICTORY_PORT_DESCRIPTORS_HOT`), which kept the light right in these runs. With
   port 2 off, the median frame went from 72 to 82 ms and 23 % of seconds had a frame over 250 ms.
 - **Things that come into view** can stay black or at their lowest detail for some seconds; driving
-  fast, the texture queue grows past 10,000, but the game no longer freezes waiting for it.
+  fast through the city the texture queue stayed under 2,200 in run YP26, and the game no longer
+  freezes waiting for it.
 - The first run of a new build or driver is slow until its pipelines are made: run
   `victory.exe warm --used` after a session (it makes the ones played with).
 - Hair can be drawn over faces in some shots.
@@ -59,8 +60,12 @@ On top of VIctory-7900XTX (merged up to c9c932c; what that fork does, and why, i
   dispatch in flight.
 - **Pull requests of VIctory-7900XTX taken early:** #92 (TheHoracio), #98 (Joly0), #105 and #108
   (SousaTrashBin), #96 (kalijerry; its part for capped heaps left out), #126 (ESAT586) and #141
-  (mattkajorinc: thin LTO), #327 (finegorko) and #304 (zocram4cc; off by default, no gain measured
-  here: the mapping lock hardly ever waits on this machine). #24, #77, #87 and #128, taken earlier, are in upstream's main now; #68
+  (mattkajorinc: thin LTO), #327 (finegorko), #304 (zocram4cc; off by default, no gain measured
+  here: the mapping lock hardly ever waits on this machine), #335 (brainbudt: faster texture tiling
+  and detiling; the texture queue's peaks about halved) and #351 (Fedalv: card-step copies outside
+  their buffers left out). #337 was tried and left out: its span cache made frames of 8,000-12,000
+  draws slower here (88-91 against 75-78 ms). The pull request #1 of this fork (real-alponzo: four
+  fixes, and switches for 16 GB cards and the Series S) is in too. #24, #77, #87 and #128, taken earlier, are in upstream's main now; #68
   and #125 were left out where upstream reworked the same code (renderer port 6, pipeline waits).
 - **The caption's performance figures**, the slow-frame line, and stopwatches of the texture side of
   the pass over the view heap (diagnostics).
