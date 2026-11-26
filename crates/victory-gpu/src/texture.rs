@@ -129,6 +129,21 @@ const HOT_FRAMES: u64 = 64;
 /// the start (the six-star screen of the first seconds, which the hash
 /// never caught changing). `VICTORY_TEXTURE_HOT=0`: every eighth frame
 /// only, as before.
+/// How many frames apart a partly mapped texture (a streamed one with only
+/// some mips' pages there) is read again: `VICTORY_TEXTURE_PARTIAL_FRAMES`,
+/// 30 unless set (1 to 240). At 30, a mip that streams in showed up to two
+/// seconds late at 14 fps; each read goes around the unmapped pages of the
+/// whole texture, so fewer frames cost more of the refresh threads.
+fn partial_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_PARTIAL_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(30, |n| n.clamp(1, 240))
+    })
+}
+
 fn hot_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
@@ -1401,11 +1416,12 @@ impl Staging {
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what
             // is there; nothing at all mapped changes nothing.
-            // shortcut: read again at most every 30 frames (reading around
-            // unmapped pages is slow, and nothing tells us when pages
-            // arrive): a mip that streams in shows up to 30 frames late.
+            // shortcut: read again at most every [`partial_frames`] frames
+            // (reading around unmapped pages is slow, and nothing tells us
+            // when pages arrive): a mip that streams in shows up to that many
+            // frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + partial_frames()) {
                 return 0;
             }
             last.partial = Some(frame);
