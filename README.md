@@ -16,8 +16,8 @@ diagnostics build, `scripts\play.ps1`'s settings, shaders translated and pipelin
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| Open world and city, played | median 80 ms a frame (12-13 fps); one frame in ten over 101 ms |
-| Stutters | 27 % of seconds have a frame over 150 ms, 3 % over 250 ms |
+| Open world and city, played | median 72 ms a frame (about 14 fps); one frame in ten over 94 ms |
+| Stutters | 19 % of seconds have a frame over 150 ms, 1 % over 250 ms |
 | Looking at the ground (few draws) | about 43 ms a frame (21-23 fps) |
 | Longest session played | 32 minutes; 17 minutes with these settings, no device loss |
 | Memory | about 40 GB of private memory; video memory held near 80 % of its budget: **64 GB of RAM needed** |
@@ -29,11 +29,13 @@ log saying where its time went (`victory_gpu::slow`, `VICTORY_SLOW_FRAME_MS`).
 
 What is known to be wrong:
 
-- **Stutters.** What costs most in a slow frame: preparing the submission on the CPU (~70 ms), the
-  texture side of the pass over the view heap (~55 ms) and looking at its slots (~33 ms). Renderer
-  port 2 would remove the last, but on this machine it leaves the indirect light black (it misses
-  thousands of the title's view writes a frame); it stays off.
-- **Things that come into view** can stay black or at their lowest detail for some seconds.
+- **Stutters.** What costs most in a slow frame now is the title's own work on the CPU and the
+  texture side of the pass over the view heap. Renderer port 2 still misses view writes the title
+  makes outside the stores it patches; pages where records were missed are looked at whole every
+  frame for a while (`VICTORY_PORT_DESCRIPTORS_HOT`), which kept the light right in these runs. With
+  port 2 off, the median frame went from 72 to 82 ms and 23 % of seconds had a frame over 250 ms.
+- **Things that come into view** can stay black or at their lowest detail for some seconds; driving
+  fast, the texture queue grows past 10,000, but the game no longer freezes waiting for it.
 - The first run of a new build or driver is slow until its pipelines are made: run
   `victory.exe warm --used` after a session (it makes the ones played with).
 - Hair can be drawn over faces in some shots.
@@ -57,7 +59,8 @@ On top of VIctory-7900XTX (merged up to c9c932c; what that fork does, and why, i
   dispatch in flight.
 - **Pull requests of VIctory-7900XTX taken early:** #92 (TheHoracio), #98 (Joly0), #105 and #108
   (SousaTrashBin), #96 (kalijerry; its part for capped heaps left out), #126 (ESAT586) and #141
-  (mattkajorinc: thin LTO). #24, #77, #87 and #128, taken earlier, are in upstream's main now; #68
+  (mattkajorinc: thin LTO), #327 (finegorko) and #304 (zocram4cc; off by default, no gain measured
+  here: the mapping lock hardly ever waits on this machine). #24, #77, #87 and #128, taken earlier, are in upstream's main now; #68
   and #125 were left out where upstream reworked the same code (renderer port 6, pipeline waits).
 - **The caption's performance figures**, the slow-frame line, and stopwatches of the texture side of
   the pass over the view heap (diagnostics).

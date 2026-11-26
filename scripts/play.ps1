@@ -18,13 +18,16 @@ $settings = @{
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '0'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
     VICTORY_WINDOW_BUDGET_MB = '2048'
-    # Tested in this fork (runs YP16-YP18, RX 7900 XTX): renderer ports 1, 6 and 7 on (2 and 3 leave
-    # the indirect light black); textures kept below 80 % of the card's budget, the card's empty
-    # blocks not kept (it filled and spilled into the PC's memory: 7 fps); card-awake off (the
-    # driver reset twice with it); windows of title memory in the PC's memory; direct file reads.
+    # Tested in this fork (runs YP19-YP23, RX 7900 XTX): renderer ports 1, 2, 3, 6 and 7 on (port 2
+    # with its pages of missed records looked at whole, port 3 reading from a copy: with port 3 in
+    # place or port 2's round alone, the indirect light went black); textures kept below 80 % of the
+    # card's budget, the card's empty blocks not kept (it filled and spilled into the PC's memory:
+    # 7 fps); card-awake off (the driver reset twice with it); windows of title memory in the PC's
+    # memory. Reads of the game's files stay buffered: direct reads halved streaming (YP20).
     VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_GUARD = '1'; VICTORY_PORT_JOURNAL = '1'
+    VICTORY_PORT_DESCRIPTORS = '1'; VICTORY_PORT_DESCRIPTORS_EVERY = '2'; VICTORY_PORT_DESCRIPTORS_CHECK = '32'
+    VICTORY_PORT_CBV = '1'; VICTORY_PORT_CBV_PLACE = '0'
     VICTORY_TEXTURE_ROOM_PERCENT = '80'; VICTORY_KEEP_FREED = '0'; VICTORY_WINDOWS_VRAM = '0'
-    VICTORY_DSTORAGE_IO = 'direct'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
