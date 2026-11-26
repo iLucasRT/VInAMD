@@ -43,6 +43,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Cumulative microseconds waited on this pipeline across frames so a
+    /// slow or stuck compile cannot consume every frame's wait budget.
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -76,12 +80,26 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.made.get_or_init(build);
+        }));
+        if outcome.is_err() {
+            tracing::error!(
+                key = %self.key,
+                shaders = ?self.shaders,
+                "pipeline worker panicked while building host pipeline; refusing it"
+            );
+            let _ = self.made.set(None);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -200,31 +218,65 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while both frame `frame` and pipeline `p` have budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
-    if budget.is_zero() {
-        return;
-    }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-    let spent_of = &SPENT[usize::from(screen)];
-    let shared = shared_budget();
+    let Some((waited, elapsed)) = wait_with(p, frame, budget, shared_budget(), &SPENT[usize::from(screen)]) else {
+        return;
+    };
+    if screen && waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some(),
+            shaders = ?p.shaders,
+            "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        elapsed.as_micros() as u64,
+    );
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = elapsed;
+}
+
+/// Core wait bounded by both frame `frame`'s remaining budget and `p`'s
+/// cumulative allowance (`budget` in total across all frames). Returns
+/// `Some((clamped_wait, actual_elapsed))` when a wait occurred, or `None` if
+/// either budget was already exhausted.
+fn wait_with(
+    p: &Pending,
+    frame: u64,
+    budget: Duration,
+    shared: bool,
+    spent_of: &Mutex<(u64, Duration)>,
+) -> Option<(Duration, Duration)> {
+    if budget.is_zero() {
+        return None;
+    }
+    let already = Duration::from_micros(p.waited_us.load(Ordering::Relaxed));
+    let pipeline_left = budget.saturating_sub(already);
+    if pipeline_left.is_zero() {
+        return None;
+    }
     let left = {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(pipeline_left);
         if shared {
             spent.1 += left;
         }
         left
     };
     if left.is_zero() {
-        return;
+        return None;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -237,15 +289,15 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
-    let waited = started.elapsed().min(left);
-    if screen && waited > Duration::from_millis(500) {
-        tracing::info!(
-            ms = waited.as_millis() as u64,
-            made = p.made.get().is_some(),
-            shaders = ?p.shaders,
-            "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
-        );
-    }
+    let elapsed = started.elapsed();
+    let waited = elapsed.min(left);
+    let charge = if p.made.get().is_none() && elapsed >= left {
+        left
+    } else {
+        waited
+    };
+    p.waited_us
+        .fetch_add(charge.as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
     {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
@@ -257,11 +309,7 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::PipelineWaitUs,
-        started.elapsed().as_micros() as u64,
-    );
+    Some((waited, elapsed))
 }
 
 const NOT_QUEUED: u8 = 0;
@@ -577,5 +625,45 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn pipeline_wait_caps_total_wait_per_pipeline_across_frames() {
+        let slow = Pending::new(Vec::new(), None);
+        let fresh = Pending::new(Vec::new(), None);
+        let spent = Mutex::new((u64::MAX, Duration::ZERO));
+        let budget = Duration::from_millis(20);
+
+        // Frame 1: `slow` spends its full allowance once.
+        let first = wait_with(&slow, 1, budget, true, &spent);
+        assert!(first.is_some());
+        assert!(Duration::from_micros(slow.waited_us.load(Ordering::Relaxed)) >= budget);
+
+        // Frame 2: `slow` must return immediately without touching frame 2's budget.
+        let started = Instant::now();
+        assert!(wait_with(&slow, 2, budget, true, &spent).is_none());
+        assert!(started.elapsed() < Duration::from_millis(10));
+
+        // Frame 2's budget is still available for another pipeline.
+        assert!(wait_with(&fresh, 2, budget, true, &spent).is_some());
+    }
+
+    #[test]
+    fn worker_panic_refuses_pipeline_and_notifies_waiters() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let waiter_p = p.clone();
+        let waiter = std::thread::spawn(move || {
+            let spent = Mutex::new((u64::MAX, Duration::ZERO));
+            wait_with(&waiter_p, 1, Duration::from_secs(5), true, &spent)
+        });
+
+        // Give the waiter a brief moment to enter the condvar wait, then panic.
+        std::thread::sleep(Duration::from_millis(10));
+        p.make_with(|| panic!("simulated compiler panic"));
+
+        assert!(matches!(p.made.get(), Some(None)));
+        let waited = waiter.join().expect("waiter thread must not panic");
+        assert!(waited.is_some());
+        assert!(waited.unwrap().1 < Duration::from_secs(2));
     }
 }
