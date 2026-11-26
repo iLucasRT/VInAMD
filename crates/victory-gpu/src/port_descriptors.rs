@@ -486,24 +486,22 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     // SAFETY: by the caller.
     let out = unsafe { real(to, from, n) };
     let len = MARKS.len.load(Acquire);
-    if len != 0 && n >= 4 {
+    if len != 0 && n != 0 {
         let start = MARKS.start.load(Relaxed);
         let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
         if lo < hi {
             COPIES[0].fetch_add(1, Relaxed);
             let half = !(to as u64).wrapping_sub(start).is_multiple_of(32);
             COPIES[2].fetch_add(u64::from(half), Relaxed);
-            // Each slot whose first word now lies in the copy and is a view's.
-            let mut slot = (lo - start).div_ceil(32);
             let mut marked = 0;
-            while start + slot * 32 + 4 <= hi {
+            for slot in slots_touched(len, lo - start, hi - start) {
                 let at = start + slot * 32;
-                // SAFETY: just written by the copy, inside the heap.
+                // SAFETY: inside the heap (`slots_touched`); the copy wrote
+                // at least one of the slot's bytes.
                 if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
                     mark_slot(slot as usize);
                     marked += 1;
                 }
-                slot += 1;
             }
             COPIES[1].fetch_add(marked, Relaxed);
             if half {
@@ -522,6 +520,16 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
         }
     }
     out
+}
+
+/// The slots of a heap `len` bytes long that a copy over its bytes
+/// `[lo, hi)` writes into, whose first word (a view record's tag) lies in the
+/// heap: the slot the copy begins in too, since a copy may rewrite a record's
+/// later words (its address, its size) and leave the tag as it was. Counting
+/// only the slots whose first word the copy wrote missed 95 view records a
+/// frame of 101 the fallback found (a retail game, its boat scene).
+fn slots_touched(len: u64, lo: u64, hi: u64) -> std::ops::Range<u64> {
+    lo / 32..hi.div_ceil(32).min(len.saturating_sub(4) / 32 + 1).max(lo / 32)
 }
 
 /// Marks slot `slot` of the marked heap (in it: checked by the caller).
@@ -602,6 +610,20 @@ pub(crate) fn line(frames: f64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_copy_into_a_record_marks_the_slot_it_begins_in() {
+        // Whole records.
+        assert_eq!(super::slots_touched(1024, 64, 128), 2..4);
+        // Into a record's later words only (its tag left as it was).
+        assert_eq!(super::slots_touched(1024, 72, 96), 2..3);
+        // Over the end of one record and the start of the next.
+        assert_eq!(super::slots_touched(1024, 48, 72), 1..3);
+        // One byte.
+        assert_eq!(super::slots_touched(1024, 1023, 1024), 31..32);
+        // A heap whose last slot holds no whole tag.
+        assert_eq!(super::slots_touched(1026, 1024, 1026), 32..32);
+    }
+
     use super::*;
 
     #[test]
