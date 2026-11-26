@@ -159,7 +159,7 @@ impl GraphicsState {
             && (self.depth_format == DXGI_FORMAT_UNKNOWN
                 || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
             && self.targets.NumRenderTargets > 0
-            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+            && matches!(self.topology.0, 3 | 19 | 32)
     }
 
     /// Takes in one subobject of a stream: its type, then its data at +4

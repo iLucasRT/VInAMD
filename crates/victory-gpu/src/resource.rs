@@ -2436,6 +2436,13 @@ pub(crate) fn placed_textures() -> u64 {
     PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
+/// Current tracked host texture state without mutating it.
+#[cfg(windows)]
+pub(crate) fn host_state(this: This) -> Option<u32> {
+    let (host, _) = hosted(this, true)?;
+    Some(host.state.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
