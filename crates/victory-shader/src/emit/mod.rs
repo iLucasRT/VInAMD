@@ -118,7 +118,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{
+    host_hw_bvh_active, host_hw_bvh_opcode, host_settings, hw_bvh_switch, set_host_hw_bvh,
+    set_host_max_wave, set_host_rdna, set_thread_max_wave,
+};
 pub use rect::rect_list_gs;
 
 /// Whether a raw access to a buffer the program picks from the view heap by
@@ -138,9 +141,12 @@ pub fn pick_bound() -> bool {
     !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_PICK_BOUND").is_none_or(|v| v != "0"))
 }
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    AMD_EXT_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_VA_OFFSET, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, SLOT_AMD_EXT, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_BYTES,
+    SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED,
+    VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, constants_raw, raw_views, set_raw_views,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -333,6 +339,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&lower::host_rdna().to_le_bytes());
+    out.push(lower::host_hw_bvh_opcode());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
