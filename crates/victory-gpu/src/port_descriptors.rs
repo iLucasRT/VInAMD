@@ -238,6 +238,23 @@ fn check_budget() -> usize {
     *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16usize))
 }
 
+/// Frames a page stays looked at every frame after a missed view record was
+/// found on it (`VICTORY_PORT_DESCRIPTORS_HOT=<frames>`, 240; 0: none, the
+/// round alone as before).
+fn hot_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(240))
+}
+
+/// At most this many such pages a frame (some 0.04 ms each).
+const HOT_MOST: usize = 256;
+
+/// The pages missed view records were found on, by the frame of the last.
+static HOT: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Since the last line: hot pages looked at.
+static HOT_LOOKED: AtomicU64 = AtomicU64::new(0);
+
 /// The fallback's pages: those the watch said were written, not looked at yet;
 /// the frame it last asked in, and the frame it last looked in.
 struct Fallback {
@@ -279,8 +296,26 @@ pub(crate) fn to_check(frame: u64) -> Vec<usize> {
         return Vec::new();
     }
     f.looked = frame;
-    let mut out = Vec::new();
-    while out.len() < check_budget() {
+    // The pages a missed view record was found on lately are looked at every
+    // frame, beside the budget: the writers the patches miss write the same
+    // places again, and a slot there showed its old view until the round of
+    // the heap came back to its page (eight frames' asking, sixteen pages a
+    // frame), which left the indirect light black (runs YP13-YP14).
+    let mut out: Vec<usize> = {
+        let hot_frames = hot_frames();
+        let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+        hot.retain(|_, &mut last| hot_frames != 0 && frame.saturating_sub(last) <= hot_frames);
+        let mut pages: Vec<usize> = hot.keys().copied().collect();
+        pages.sort_unstable();
+        pages.truncate(HOT_MOST);
+        pages
+    };
+    for page in &out {
+        f.pages.remove(page);
+    }
+    HOT_LOOKED.fetch_add(out.len() as u64, Relaxed);
+    let budget = check_budget() + out.len();
+    while out.len() < budget {
         let from = f.next;
         let Some(&page) = f.pages.range(from..).next().or_else(|| f.pages.iter().next()) else {
             break;
@@ -313,6 +348,10 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
     let n = CHECKED[1].fetch_add(1, Relaxed);
     MISSED_ALL.fetch_add(1, Relaxed);
+    if hot_frames() != 0 {
+        let page = handle as usize & !(crate::watch::PAGE - 1);
+        HOT.lock().unwrap_or_else(|e| e.into_inner()).insert(page, crate::frame::current());
+    }
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
     let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
@@ -448,7 +487,7 @@ pub(crate) fn line(frames: f64) {
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
+         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole ({:.1} of them where records were missed lately, VICTORY_PORT_DESCRIPTORS_HOT), {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
@@ -458,6 +497,7 @@ pub(crate) fn line(frames: f64) {
         copies[0] as f64 / frames,
         copies[1] as f64 / frames,
         pages as f64 / frames,
+        HOT_LOOKED.swap(0, Relaxed) as f64 / frames,
         missed as f64 / frames,
         tabled as f64 / frames,
         other as f64 / frames,
