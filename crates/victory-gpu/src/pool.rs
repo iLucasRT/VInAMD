@@ -212,11 +212,19 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    /// Blocks of the PC's memory (staging): their spares do not follow the
+    /// card's room ([`SPARES`]), only the PC's commit.
+    system: bool,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, system: false }
+    }
+
+    /// A pool of the PC's memory ([`Pool::system`]).
+    const fn new_system(most: usize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, system: true }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -319,7 +327,16 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        // Staging blocks are the PC's memory: kept whatever the card's room,
+        // unless the PC has little left to commit. With the card's two
+        // (`VICTORY_KEEP_FREED=0`) they went and were made again in bursts:
+        // 207 ms of a frame taking staging from the pool (run YP16).
+        let limit = if self.system {
+            if crate::resource::commit_short().is_some() { SPARE } else { self.most }
+        } else {
+            SPARES.load(Ordering::Relaxed)
+        };
+        self.reclaim(now, limit, false);
     }
 
     /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
@@ -363,7 +380,7 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new_system(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -402,6 +419,8 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+        // (Counted with the texture pass's parts: a block made anew.)
+        let _made = crate::draw::TexPart::new(5);
         // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
         // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
