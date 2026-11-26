@@ -8987,8 +8987,41 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// A frame past `VICTORY_SLOW_FRAME_MS` (150; 0: none) gets a line of its
+/// own saying where its time went (`victory_gpu::slow`): what the counters
+/// of the frame line gained over that frame alone. The rest of a frame is
+/// the title's own work and its waits. (After the slow-frame report of
+/// Marvisak/VIctory pull request #2721, 0xkn0wh3r3; written for this tree.)
+fn slow_frame_ms() -> f64 {
+    static MS: OnceLock<f64> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_SLOW_FRAME_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(150.0))
+}
+
+/// The counters a slow frame's line is made of, in their own units: the
+/// submitting thread preparing (us) and waiting for the card (us); title
+/// memory copies (us) and texture refreshes (us) of the preparing; copying
+/// back (us); the card idle (us); the heap pass looking at slots, spans and
+/// textures (ns); draws.
+fn slow_counters() -> [u64; 10] {
+    let l = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    [
+        l(&SUBMISSION_US[0]),
+        l(&SUBMISSION_US[1]),
+        l(&PREPARING[0]),
+        l(&PREPARING[2]),
+        l(&COPY_BACK[0]),
+        l(&CARD_CLOCK_US[0]),
+        l(&crate::draw::HEAP_SPLIT[0]),
+        l(&crate::draw::HEAP_SPLIT[1]),
+        l(&crate::draw::HEAP_SPLIT[2]),
+        crate::draw::drawn(),
+    ]
+}
+
 struct Meter {
     since: std::time::Instant,
+    /// [`slow_counters`] at the last present.
+    slow_base: [u64; 10],
     /// When the last frame was presented, and the longest one since the
     /// last caption.
     last: std::time::Instant,
@@ -9009,6 +9042,7 @@ impl Meter {
             since: now,
             last: now,
             longest: std::time::Duration::ZERO,
+            slow_base: slow_counters(),
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
@@ -9030,8 +9064,36 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
-        self.longest = self.longest.max(self.last.elapsed());
+        let took = self.last.elapsed();
+        self.longest = self.longest.max(took);
         self.last = std::time::Instant::now();
+        {
+            let now = slow_counters();
+            let base = std::mem::replace(&mut self.slow_base, now);
+            let limit = slow_frame_ms();
+            let ms = took.as_secs_f64() * 1e3;
+            if limit > 0.0 && ms >= limit {
+                // (A counter the frame line took since starts again from 0.)
+                let d: [f64; 10] = std::array::from_fn(|i| if now[i] >= base[i] { now[i] - base[i] } else { now[i] } as f64);
+                let ours = (d[0] + d[1] + d[4]) / 1e3;
+                tracing::info!(
+                    target: "victory_gpu::slow",
+                    "slow frame: {ms:.0} ms; submitting thread preparing {:.1} ms (copies {:.1}, textures {:.1}), waiting for the card                      {:.1}, copying back {:.1}; the rest {:.1} (the title's own work and waits); card idle {:.1} ms; heap pass: slots                      {:.1} ms, spans {:.1}, textures {:.1}; {:.0} draws; pipelines being made {}",
+                    d[0] / 1e3,
+                    d[2] / 1e3,
+                    d[3] / 1e3,
+                    d[1] / 1e3,
+                    d[4] / 1e3,
+                    (ms - ours).max(0.0),
+                    d[5] / 1e3,
+                    d[6] / 1e6,
+                    d[7] / 1e6,
+                    d[8] / 1e6,
+                    d[9],
+                    crate::pipeline::making(),
+                );
+            }
+        }
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
