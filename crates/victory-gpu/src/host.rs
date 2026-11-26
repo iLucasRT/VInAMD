@@ -173,12 +173,18 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    // Below the share where new textures stop being made
+    // (`VICTORY_TEXTURE_ROOM_PERCENT`, 90): with that set to 70, none were
+    // made from 70 % on and none let go until 88 %, and what came into view
+    // stayed black for good (run YP15: 4,719 passes made none).
+    let room = crate::resource::room_percent();
+    let (keep, down, short) = (room.saturating_sub(2).min(88), room.saturating_sub(5).min(85), (room + 5).min(95));
+    if used < share(keep) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(short) {
+        (IDLE_MS, used - share(down))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(down))
     }
 }
 
