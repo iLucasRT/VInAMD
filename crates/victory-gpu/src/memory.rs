@@ -103,9 +103,20 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (run light-4). The burst counter
+/// decays by [`FAULT_RECOVER`] each frame so a single busy stretch does not
+/// permanently stop fault-mapping for the rest of the session (#102).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+const FAULT_RECOVER: usize = 16;
+
+fn recover_fault_budget(faulted: usize) -> usize {
+    faulted.saturating_sub(FAULT_RECOVER)
+}
+
+fn fault_budget_allows(made_this_frame: usize, faulted: usize) -> bool {
+    made_this_frame < FAULTS && faulted < FAULTS_ALL
+}
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -657,6 +668,7 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        self.faulted = recover_fault_budget(self.faulted);
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
@@ -676,9 +688,16 @@ impl Memory {
         pages.sort_unstable();
         let mut made = 0;
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if !fault_budget_allows(made, self.faulted) {
+                break;
+            }
+            if self.copy_of(page).is_none() && self.map(page) {
                 made += 1;
-                self.faulted += 1;
+                // Only arena allocations count against the stray-fault burst
+                // budget; pages resolved to an existing title buffer do not.
+                if self.pages.contains_key(&page) {
+                    self.faulted += 1;
+                }
                 self.bring(page, page + 1);
             }
         }
@@ -1300,5 +1319,24 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn fault_budget_enforces_burst_cap_and_recovers_across_frames() {
+        assert!(fault_budget_allows(0, 0));
+        assert!(!fault_budget_allows(FAULTS, 0));
+        assert!(!fault_budget_allows(0, FAULTS_ALL));
+
+        // Once saturated, subsequent frames recover FAULT_RECOVER pages/frame
+        // instead of stalling fault-mapping permanently.
+        let after_one_frame = recover_fault_budget(FAULTS_ALL);
+        assert_eq!(after_one_frame, FAULTS_ALL - FAULT_RECOVER);
+        assert!(fault_budget_allows(0, after_one_frame));
+        assert!(fault_budget_allows(FAULT_RECOVER - 1, after_one_frame + FAULT_RECOVER - 1));
+        assert!(!fault_budget_allows(FAULT_RECOVER, after_one_frame + FAULT_RECOVER));
+
+        // Recovery saturates at zero on quiet frames.
+        assert_eq!(recover_fault_budget(0), 0);
+        assert_eq!(recover_fault_budget(FAULT_RECOVER / 2), 0);
     }
 }
