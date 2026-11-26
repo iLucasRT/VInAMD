@@ -233,8 +233,10 @@ impl Worker {
             value += 1;
             if let Err(e) = self.copy(&jobs, value) {
                 tracing::warn!(error = %e, "uploads ahead did not run");
+                abort(jobs);
+            } else {
+                finish(jobs);
             }
-            finish(jobs);
         }
     }
 
@@ -284,6 +286,18 @@ impl Job {
             unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }
     }
+}
+
+/// The jobs' copies failed: clear in-flight tracking without marking them
+/// uploaded or publishing descriptor flips.
+fn abort(jobs: Vec<Arc<Job>>) {
+    for job in &jobs {
+        job.copy.ahead.store(NONE, Relaxed);
+        BYTES.fetch_sub(job.staging.read as u64, Relaxed);
+    }
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    way.retain(|(serial, _)| !jobs.iter().any(|job| job.copy.serial == *serial));
+    LANDED.notify_all();
 }
 
 /// The jobs' copies have run.

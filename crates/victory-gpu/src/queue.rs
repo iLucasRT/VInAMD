@@ -996,11 +996,14 @@ extern "system" fn present(
         };
         let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-                crate::resource::host_transition(resource, state);
-                // (Lists not translated yet leave it in no state yet: the
-                // one it is in when its turn in the line comes.)
-                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                // With `VICTORY_THIN=1`, lists have not translated yet so
+                // `victory-submit` owns state transitions; do not mutate
+                // `HostTexture::state` concurrently from the Present thread.
+                let state = if crate::list::thin::wanted() {
+                    u32::MAX
+                } else {
+                    crate::resource::host_state(resource).unwrap_or(COPY_SOURCE)
+                };
                 (resource as usize, copy, state)
             })
         };

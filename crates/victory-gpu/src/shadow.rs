@@ -399,9 +399,12 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+    if !crate::residency::admit_local_vram(size, true)
+        || host
+            .video_memory()
+            .is_some_and(|[budget, used, ..]| used + size > budget / 100 * hundredths)
     {
+        let [budget, used, ..] = host.video_memory().unwrap_or([0; 4]);
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.
@@ -1576,9 +1579,15 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS` overrides).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    std::env::var("VICTORY_WIDE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or_else(
+            || std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6),
+            |n| n.clamp(1, 16),
+        )
 }
 
 fn workers() -> &'static Workers {

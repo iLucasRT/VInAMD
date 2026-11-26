@@ -164,6 +164,31 @@ pub(crate) fn headroom() -> Option<u64> {
     (bytes != u64::MAX).then_some(bytes)
 }
 
+/// Proportional local VRAM ceiling (`budget - 1 GiB`) so optional texture
+/// heaps and card mirrors stay below the WDDM local budget on both 16 GB and
+/// 24 GB+ GPUs without imposing a fixed cap on larger cards.
+pub(crate) fn local_vram_ceiling(budget: u64) -> u64 {
+    budget.saturating_sub(GIB)
+}
+
+/// Under `VICTORY_RESIDENCY=1`, gates optional local VRAM growth against
+/// [`local_vram_ceiling`] (with an extra 512 MiB buffer for speculative
+/// growth) without arming the 500 ms OOM error timer.
+pub(crate) fn admit_local_vram(bytes: u64, speculative: bool) -> bool {
+    if !on() {
+        return true;
+    }
+    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return true;
+    };
+    if budget == 0 {
+        return true;
+    }
+    let ceiling = local_vram_ceiling(budget);
+    let limit = if speculative { ceiling.saturating_sub(512 * MIB) } else { ceiling };
+    used.saturating_add(bytes) <= limit
+}
+
 pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
 }
@@ -229,5 +254,12 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn local_vram_ceiling_scales_with_adapter_budget() {
+        assert_eq!(local_vram_ceiling(13_824 * MIB), 12_800 * MIB);
+        assert_eq!(local_vram_ceiling(22 * GIB), 21 * GIB);
+        assert_eq!(local_vram_ceiling(512 * MIB), 0);
     }
 }

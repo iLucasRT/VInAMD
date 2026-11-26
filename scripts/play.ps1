@@ -1,6 +1,8 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
+# -RDNA2        optional 16 GB VRAM / 32 GB RAM budget tuning (leaves default invocation unchanged)
+# -SeriesS      run with the Xbox Series S console profile (--console series-s)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
@@ -8,6 +10,8 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
+    [switch]$RDNA2,
+    [switch]$SeriesS,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
@@ -34,6 +38,19 @@ if ($Safe) {
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
+if ($RDNA2) {
+    # Optional 16 GB VRAM / 32 GB RAM profile on top of the tested defaults:
+    # enables residency admission gating, caps card/window buffers for 13.5 GB WDDM budget,
+    # and balances copy/dstorage worker counts on 8C/16T hosts.
+    $settings.VICTORY_RESIDENCY = '1'
+    $settings.VICTORY_UPLOAD_AHEAD = '0'
+    $settings.VICTORY_AMBIENT_AIR = '1.5'
+    $settings.VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    $settings.VICTORY_CARD_BUFFERS_MB = if ($SeriesS) { '768' } else { '1280' }
+    $settings.VICTORY_WINDOW_BUDGET_MB = if ($SeriesS) { '512' } else { '1024' }
+    $settings.VICTORY_WIDE_THREADS = '8'
+    $settings.VICTORY_DSTORAGE_WORKERS = '8'
+}
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
@@ -52,5 +69,8 @@ if ($discarded) {
     Write-Host "Discarded inherited values for $($discarded.Name -join ', '). Use -More to pass them explicitly."
 }
 $Exe = (Resolve-Path $Exe).Path
+$runArgs = @('run', $Exe)
+if ($SeriesS) { $runArgs += @('--console', 'series-s') }
+$runArgs += '--execute'
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try { & $victory @runArgs } finally { Pop-Location }

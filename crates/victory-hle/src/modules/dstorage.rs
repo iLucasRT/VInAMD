@@ -628,7 +628,11 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let default_workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(default_workers, |n| n.clamp(1, 32));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
