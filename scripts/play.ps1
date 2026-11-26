@@ -15,9 +15,16 @@ param(
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
-    VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
+    VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '0'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
     VICTORY_WINDOW_BUDGET_MB = '2048'
+    # Tested in this fork (runs YP16-YP18, RX 7900 XTX): renderer ports 1, 6 and 7 on (2 and 3 leave
+    # the indirect light black); textures kept below 80 % of the card's budget, the card's empty
+    # blocks not kept (it filled and spilled into the PC's memory: 7 fps); card-awake off (the
+    # driver reset twice with it); windows of title memory in the PC's memory; direct file reads.
+    VICTORY_PORT_CONSTANTS = '1'; VICTORY_PORT_GUARD = '1'; VICTORY_PORT_JOURNAL = '1'
+    VICTORY_TEXTURE_ROOM_PERCENT = '80'; VICTORY_KEEP_FREED = '0'; VICTORY_WINDOWS_VRAM = '0'
+    VICTORY_DSTORAGE_IO = 'direct'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

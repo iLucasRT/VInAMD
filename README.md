@@ -11,55 +11,56 @@ of the game. It is not affiliated with or endorsed by the game's developer or pu
 ## Where it stands (2026-11-26)
 
 Tested on one machine only: Windows 11, AMD Ryzen 7 5800X3D, 64 GB RAM, Radeon RX 7900 XTX 24 GB,
-diagnostics build, second launch of the build.
+diagnostics build, `scripts\play.ps1`'s settings, shaders translated and pipelines made ahead.
 
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| Prison cell, standing still | 65-73 ms a frame (14-15 fps) |
-| Open world, played | median 89 ms a frame (11 fps); one frame in ten over 135 ms; stutters remain |
-| Longest session played | 32 minutes, no device loss |
-| Memory | about 40-42 GB of private memory, steady after 10 minutes: **64 GB of RAM needed** |
+| Open world and city, played | median 80 ms a frame (12-13 fps); one frame in ten over 101 ms |
+| Stutters | 27 % of seconds have a frame over 150 ms, 3 % over 250 ms |
+| Looking at the ground (few draws) | about 43 ms a frame (21-23 fps) |
+| Longest session played | 32 minutes; 17 minutes with these settings, no device loss |
+| Memory | about 40 GB of private memory; video memory held near 80 % of its budget: **64 GB of RAM needed** |
 
 The window's caption tells where a frame's time goes: peak frame, CPU and copies, copying back,
 the card's busy share, video memory, RAM, free commit, and pipelines and textures pending
-(`VICTORY_TITLE_STATS=0`: the frame rate only).
+(`VICTORY_TITLE_STATS=0`: the frame rate only). A frame over 150 ms gets a line of its own in the
+log saying where its time went (`victory_gpu::slow`, `VICTORY_SLOW_FRAME_MS`).
 
 What is known to be wrong:
 
-- **Memory.** Free commit can still fall to about 2 GB with a page file sized by Windows.
-- **Trees flicker** in the open world, appearing and disappearing. Not memory alone: it stays
-  with textures let go only below 2 GB of free commit, after a minute unused. Being looked at.
-- **Stutters.** About one second in five has a frame over 150 ms; 10 fps can feel like 3-4.
-  Being looked at.
-- **Streaming.** The title asks for files in bursts of thousands; requests wait up to a second or
-  more, and models (people, trees) can stay at their lowest detail for a while. Being looked at.
-- The open world has dips of 150-450 ms a frame while it streams.
+- **Stutters.** What costs most in a slow frame: preparing the submission on the CPU (~70 ms), the
+  texture side of the pass over the view heap (~55 ms) and looking at its slots (~33 ms). Renderer
+  port 2 would remove the last, but on this machine it leaves the indirect light black (it misses
+  thousands of the title's view writes a frame); it stays off.
+- **Things that come into view** can stay black or at their lowest detail for some seconds.
+- The first run of a new build or driver is slow until its pipelines are made: run
+  `victory.exe warm --used` after a session (it makes the ones played with).
 - Hair can be drawn over faces in some shots.
-- Rooms with little direct light are dark unless the title's ray tracing is turned on (`-RayTracing`).
-- The first run of a new build or driver is slow for some minutes while pipelines are made.
 
 ## What is different here
 
-On top of VIctory-7900XTX (what that fork does, and why, is in [docs/findings.md](docs/findings.md)):
+On top of VIctory-7900XTX (merged up to c9c932c; what that fork does, and why, is in
+[docs/findings.md](docs/findings.md)):
 
 - **Raw accesses to buffers picked from the view heap stay inside the view found there**
   (`VICTORY_PICK_BOUND`, on). On AMD a raw access through a structured or typed view is held to the
   element index alone, and a byte offset read from memory that holds something else reached up to
   4 GiB past the view; Radeon GPU Detective named the load. On this machine, without the bound every
   run that moved through the world lost the device within 4 to 10 minutes; with it none did.
-- **A copy that meets one of the title's guard pages puts the guard back** before it fails, as the
-  kernel's copy leaves it.
-- **Memory under pressure:** host copies of textures, and empty blocks of the card's memory, go
-  when the PC has little left to commit (`VICTORY_TEXTURE_COMMIT_MB`).
-- **Pull requests of VIctory-7900XTX taken early:** #24 (UwUCammie), #68 (zocram4cc), #77
-  (Adika713; `scripts\play.ps1` sets `VICTORY_WINDOW_BUDGET_MB=2048`), #87, #92 (TheHoracio:
-  windows of title memory in the card's memory), #98 (Joly0: streaming stores for big copies),
-  #105 and #108 (SousaTrashBin: card steps without the waits behind placed copies; a loop limit
-  for the ray march `39f0e9aeb156a61c`, `VICTORY_SHADER_LOOP_LIMITS`) and #96 (kalijerry:
-  dynamic descriptors from eight sharded pools). Upstream's main is merged up to 85d5641.
-- **The caption's performance figures**, and stopwatches of the texture side of the pass over the
-  view heap (diagnostics).
+- **Video memory kept below its budget:** textures are let go from just under the share where new
+  ones stop being made (`VICTORY_TEXTURE_ROOM_PERCENT`, 80 in `play.ps1`); at upstream's 88 %, the
+  card filled after some 17 minutes and spilled into the PC's memory (130-147 ms of GPU a frame).
+- **The PC's memory:** host copies of textures and empty blocks of the card's memory go when the PC
+  has little left to commit (`VICTORY_TEXTURE_COMMIT_MB`, 2048); staging blocks keep their spares.
+- **Card-awake off in `play.ps1`:** with it, the driver reset twice after 10-12 minutes with only its
+  dispatch in flight.
+- **Pull requests of VIctory-7900XTX taken early:** #92 (TheHoracio), #98 (Joly0), #105 and #108
+  (SousaTrashBin), #96 (kalijerry; its part for capped heaps left out), #126 (ESAT586) and #141
+  (mattkajorinc: thin LTO). #24, #77, #87 and #128, taken earlier, are in upstream's main now; #68
+  and #125 were left out where upstream reworked the same code (renderer port 6, pipeline waits).
+- **The caption's performance figures**, the slow-frame line, and stopwatches of the texture side of
+  the pass over the view heap (diagnostics).
 
 ## How to run it
 
@@ -71,8 +72,9 @@ git clone https://github.com/iLucasRT/VInAMD
 cd VInAMD
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-target\diag\victory.exe shaders             # every shader translated ahead, a few minutes
+target\diag\victory.exe shaders             # every shader translated ahead, about 10 minutes
 scripts\play.ps1 -Exe <path of your copy's executable>
+target\diag\victory.exe warm --used         # after a first session: its pipelines made ahead
 ```
 
 `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when something is wrong.
