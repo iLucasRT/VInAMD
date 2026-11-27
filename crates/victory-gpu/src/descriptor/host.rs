@@ -2664,10 +2664,11 @@ impl HostHeap {
             return;
         }
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let after = if show_new_later() { job.begun_before().unwrap_or(0) } else { 0 };
         let late = Some(crate::frame::current());
         let asked = crate::host::now_ms();
         job.then(move || {
-            let flip = Flip { after: 0, heap, index, handle, key, late, asked };
+            let flip = Flip { after, heap, index, handle, key, late, asked };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -6538,5 +6539,3 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
 }
-
-
