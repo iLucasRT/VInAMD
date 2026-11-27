@@ -133,6 +133,7 @@ pub fn frames_begun() -> u64 {
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub use land::title_memory_protection;
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_remapping_in, title_memory_remapping_with, title_memory_splitting,

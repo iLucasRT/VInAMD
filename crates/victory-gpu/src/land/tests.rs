@@ -468,3 +468,20 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+/// The protection asked for a range: a later range over part of an earlier
+/// one takes its place there and leaves the rest as it was.
+#[test]
+fn asked_protection_follows_the_latest_range() {
+    let base = 0x7f00_0000_0000usize;
+    title_memory_protection(base, 0x10_0000, 0x2404);
+    assert!(write_combined(base as u64));
+    assert!(write_combined((base + 0xf_ffff) as u64));
+    assert_eq!(asked_protection((base + 0x10_0000) as u64), None);
+    // A plain range in its middle.
+    title_memory_protection(base + 0x4_0000, 0x1_0000, 0x2004);
+    assert!(write_combined((base + 0x3_ffff) as u64));
+    assert!(!write_combined((base + 0x4_0000) as u64));
+    assert_eq!(asked_protection((base + 0x4_ffff) as u64), Some(0x2004));
+    assert!(write_combined((base + 0x5_0000) as u64));
+}

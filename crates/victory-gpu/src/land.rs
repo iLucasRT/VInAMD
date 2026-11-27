@@ -131,20 +131,95 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
     now
 }
 
+/// The protection the title asked for its memory (the console's, with the
+/// bits of how each processor reaches it: 0x200 uncached, 0x400
+/// write-combined, 0x800 and on the GPU's), by range: start, then end and
+/// protection. A later range over an earlier one takes its place there.
+static ASKED: std::sync::RwLock<std::collections::BTreeMap<u64, (u64, u32)>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// The title asked for `[at, at + len)` as `protect` (`victory_hle`'s
+/// `XMemVirtualAlloc`).
+pub fn title_memory_protection(at: usize, len: usize, protect: u32) {
+    if len == 0 {
+        return;
+    }
+    let (start, end) = (at as u64, at as u64 + len as u64);
+    let mut map = ASKED.write().unwrap_or_else(|e| e.into_inner());
+    let over: Vec<u64> = map.range(..end).filter(|(_, (e, _))| *e > start).map(|(&s, _)| s).collect();
+    for s in over {
+        let (e, p) = map.remove(&s).expect("listed");
+        if s < start {
+            map.insert(s, (start, p));
+        }
+        if e > end {
+            map.insert(end, (e, p));
+        }
+    }
+    map.insert(start, (end, protect));
+}
+
+/// The protection the title asked for the memory at `address`, if known.
+pub(crate) fn asked_protection(address: u64) -> Option<u32> {
+    let map = ASKED.read().unwrap_or_else(|e| e.into_inner());
+    map.range(..=address).next_back().filter(|(_, (end, _))| address < *end).map(|(_, &(_, p))| p)
+}
+
+/// Memory the CPU reaches write-combined: a title writes it and does not
+/// read it back (reading it is very slow on the console as here).
+const WRITE_COMBINED: u32 = 0x400;
+
+/// Whether what shaders wrote into title memory the title asked to be
+/// write-combined is left on the card, not fetched and landed
+/// (`VICTORY_LAND_SKIP_WC=1`; off by default: an experiment, run YP42's
+/// landing being 138-160 MB a frame and its fetches 63-66 ms).
+pub(crate) fn skip_write_combined() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP_WC").is_some_and(|v| v == "1"))
+}
+
+/// Whether the memory at `address` is write-combined for the title's CPU.
+pub(crate) fn write_combined(address: u64) -> bool {
+    asked_protection(address).is_some_and(|p| p & WRITE_COMBINED != 0)
+}
+
+/// Since the last line: bytes left on the card for [`skip_write_combined`].
+static SKIPPED_WC: AtomicU64 = AtomicU64::new(0);
+
+/// Notes bytes left on the card ([`skip_write_combined`]).
+pub(crate) fn skipped_write_combined(bytes: u64) {
+    SKIPPED_WC.fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// (Diagnostics) Bytes fetched to land since the last line, by the title
 /// buffer they belong to (its start and length): bytes, pieces.
 #[cfg(feature = "diagnostics")]
 static BY_BUFFER: Mutex<Option<std::collections::HashMap<(u64, u64), (u64, u64)>>> = Mutex::new(None);
 
-/// (Diagnostics) Notes what a landing fetches, by title buffer.
+/// (Diagnostics) Bytes fetched to land since the last line, by the
+/// protection the title asked for them: write-combined, uncached,
+/// GPU-coherent (0x20000), other, not known.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn by_buffer(pieces: impl Iterator<Item = ((u64, u64), u64)>) {
+static BY_KIND: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// (Diagnostics) Notes what a landing fetches, by title buffer and by the
+/// protection asked for it (`(buffer span, title address, bytes)`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn by_buffer(pieces: impl Iterator<Item = ((u64, u64), u64, u64)>) {
     let mut map = BY_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    for (span, bytes) in pieces {
+    for (span, address, bytes) in pieces {
         let e = map.entry(span).or_default();
         e.0 += bytes;
         e.1 += 1;
+        let kind = match asked_protection(address) {
+            Some(p) if p & WRITE_COMBINED != 0 => 0,
+            Some(p) if p & 0x200 != 0 => 1,
+            Some(p) if p & 0x20000 != 0 => 2,
+            Some(_) => 3,
+            None => 4,
+        };
+        BY_KIND[kind].fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -163,10 +238,18 @@ fn log_by_buffer(frames: f64) {
             format!("{start:#x}+{:.1}MB: {:.1} MB/frame in {:.0} pieces", len as f64 / (1 << 20) as f64, mb(bytes), pieces as f64 / frames)
         })
         .collect();
+    let kinds = BY_KIND.each_ref().map(|k| k.swap(0, Ordering::Relaxed));
     tracing::info!(
-        "landing by title buffer per frame: {:.1} MB from {} buffers; the most: {}",
+        "landing by title buffer per frame: {:.1} MB from {} buffers; by the title's protection: write-combined {:.1} MB, \
+         uncached {:.1}, GPU-coherent {:.1}, other {:.1}, not known {:.1}; left on the card (VICTORY_LAND_SKIP_WC) {:.1} MB; the most: {}",
         mb(all),
         top.len(),
+        mb(kinds[0]),
+        mb(kinds[1]),
+        mb(kinds[2]),
+        mb(kinds[3]),
+        mb(kinds[4]),
+        mb(SKIPPED_WC.swap(0, Ordering::Relaxed)),
         list.join("; ")
     );
 }

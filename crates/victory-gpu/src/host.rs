@@ -5024,6 +5024,12 @@ impl Host {
                                     continue;
                                 }
                             }
+                            // (`VICTORY_LAND_SKIP_WC=1`) What the title asked
+                            // to be write-combined stays on the card.
+                            if land::skip_write_combined() && land::write_combined(r.shadow.span().0 + lo as u64) {
+                                land::skipped_write_combined((hi - lo) as u64);
+                                continue;
+                            }
                             if upcheck::on() {
                                 upcheck::fetched(r.shadow.id(), lo);
                             }
@@ -5054,7 +5060,7 @@ impl Host {
         }
         land::spent(land::stat::GATHER, gathering);
         #[cfg(feature = "diagnostics")]
-        land::by_buffer(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span(), (hi - lo) as u64)));
+        land::by_buffer(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span(), shadow.span().0 + *lo as u64, (hi - lo) as u64)));
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
