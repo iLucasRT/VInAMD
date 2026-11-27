@@ -82,6 +82,31 @@ pub const MEMORY_VA_OFFSET: u32 = MEMORY_PAGES * 8;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// (`VICTORY_HW_BVH=1`) Byte offset in [`SLOT_MEMORY`], past its two tables,
+/// of the dword the hardware node test reads before it runs, written by the
+/// host at start: [`HW_BVH_BOXES`], [`HW_BVH_TRIANGLES`], [`HW_BVH_VERIFY`].
+/// Switching what runs on the card's hardware then needs no translation.
+pub const MEMORY_HW_BVH_CONTROL: u32 = MEMORY_PAGES * 16;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: box nodes are tested by the card's hardware.
+pub const HW_BVH_BOXES: u32 = 1;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: triangle nodes are tested by the card's hardware.
+pub const HW_BVH_TRIANGLES: u32 = 2;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: a node the hardware tested is tested in
+/// software too; the software's answer is used, and a difference is counted
+/// in the [`SLOT_FAULTS`] buffer past its [`MEMORY_FAULTS`] dwords (one count
+/// per kind: 16-bit boxes, 32-bit boxes, triangles) with the first few kept
+/// whole ([`HW_BVH_SAMPLE`] dwords each from dword [`HW_BVH_SAMPLES_AT`] of
+/// that tail on: kind, address low and high, the software's four, the
+/// hardware's four).
+pub const HW_BVH_VERIFY: u32 = 4;
+/// Dwords of the [`SLOT_FAULTS`] buffer past [`MEMORY_FAULTS`] for
+/// [`HW_BVH_VERIFY`].
+pub const HW_BVH_TAIL: u32 = 8 + 16 * HW_BVH_SAMPLE;
+/// Dwords of one kept difference ([`HW_BVH_VERIFY`]).
+pub const HW_BVH_SAMPLE: u32 = 12;
+/// Where in the tail the kept differences start ([`HW_BVH_VERIFY`]); dword 7
+/// of the tail counts them.
+pub const HW_BVH_SAMPLES_AT: u32 = 8;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

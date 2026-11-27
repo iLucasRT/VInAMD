@@ -150,7 +150,8 @@ fn build() -> [u8; 32] {
     // Key hardware BVH dynamically (after host_settings) so calling `build()`
     // before `Host::create()` cannot lock in a stale off state.
     if victory_shader::emit::host_hw_bvh_active() {
-        hash.update(b"VICTORY_HW_BVH=1");
+        // (`;control`: the lowering that reads `MEMORY_HW_BVH_CONTROL`.)
+        hash.update(b"VICTORY_HW_BVH=1;control");
         hash.update(&[victory_shader::emit::host_hw_bvh_opcode()]);
     }
     *hash.finalize().as_bytes()

@@ -69,7 +69,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_VA_OFFSET};
+use victory_shader::emit::{
+    HW_BVH_BOXES, HW_BVH_SAMPLE, HW_BVH_SAMPLES_AT, HW_BVH_TAIL, HW_BVH_TRIANGLES, HW_BVH_VERIFY,
+    MEMORY_FAULTS, MEMORY_HW_BVH_CONTROL, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_VA_OFFSET,
+};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -216,6 +219,24 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// (`VICTORY_HW_BVH_VERIFY=1`) Nodes the hardware answered otherwise than
+    /// the software: 16-bit boxes, 32-bit boxes, triangles.
+    hw_differ: [u64; 3],
+}
+
+/// (`VICTORY_HW_BVH=1`) What the shaders let the card's hardware test, read
+/// once: `VICTORY_HW_BVH_KINDS=box`, `tri` or `none` (unset: both kinds), and
+/// `VICTORY_HW_BVH_VERIFY=1` (the software tests each node again; its answer
+/// is used and the differences are counted in the ten-second line).
+fn hw_bvh_control() -> u32 {
+    let kinds = match std::env::var("VICTORY_HW_BVH_KINDS").as_deref().map(str::trim) {
+        Ok("box" | "boxes") => HW_BVH_BOXES,
+        Ok("tri" | "triangles") => HW_BVH_TRIANGLES,
+        Ok("none") => 0,
+        _ => HW_BVH_BOXES | HW_BVH_TRIANGLES,
+    };
+    let verify = if crate::switch::on("VICTORY_HW_BVH_VERIFY") { HW_BVH_VERIFY } else { 0 };
+    kinds | verify
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -235,16 +256,31 @@ pub(crate) struct Ready {
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
-        // 16 MiB [copy, offset] directory + 16 MiB parallel 64-bit host page GPU VA table.
-        let bytes = u64::from(MEMORY_PAGES) * 16;
+        // 16 MiB [copy, offset] directory + 16 MiB parallel 64-bit host page
+        // GPU VA table, and past them the hardware node test's control dword
+        // (`MEMORY_HW_BVH_CONTROL`).
+        let bytes = u64::from(MEMORY_PAGES) * 16 + 0x1_0000;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
+        let control = hw_bvh_control();
+        // SAFETY: inside the fresh reservation.
+        unsafe { ((entries + MEMORY_HW_BVH_CONTROL as usize) as *mut u32).write_volatile(control) };
+        crate::watch::wrote(entries as usize + MEMORY_HW_BVH_CONTROL as usize, 4);
+        if victory_shader::emit::host_hw_bvh_active() {
+            tracing::info!(
+                boxes = control & HW_BVH_BOXES != 0,
+                triangles = control & HW_BVH_TRIANGLES != 0,
+                verify = control & HW_BVH_VERIFY != 0,
+                "hardware node test: what it tests (VICTORY_HW_BVH_KINDS, VICTORY_HW_BVH_VERIFY)"
+            );
+        }
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        let dwords = MEMORY_FAULTS + HW_BVH_TAIL;
+        let (faults, data) = host.shared_buffer(u64::from(dwords) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, dwords as usize * 4) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -711,6 +747,7 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         self.faulted = recover_fault_budget(self.faulted);
+        self.take_hw_differences();
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
@@ -813,6 +850,45 @@ impl Memory {
         }
     }
 
+    /// (`VICTORY_HW_BVH_VERIFY=1`) The differences the shaders counted since
+    /// the last frame; the first ones kept whole are logged once.
+    fn take_hw_differences(&mut self) {
+        let tail = |i: u32| {
+            // SAFETY: inside the faults' mapping (its tail); the GPU may be
+            // adding, a count read late is counted next frame.
+            unsafe { self.faults.1.add((MEMORY_FAULTS + i) as usize) }
+        };
+        for (k, sum) in self.stats.hw_differ.iter_mut().enumerate() {
+            let at = tail(1 + k as u32);
+            // SAFETY: as above.
+            let n = unsafe { at.read_volatile() };
+            if n != 0 {
+                *sum += u64::from(n);
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+        }
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // SAFETY: as above.
+        let kept = unsafe { tail(7).read_volatile() }.min(16);
+        if kept >= 16 && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            for s in 0..kept {
+                let w: Vec<u32> = (0..HW_BVH_SAMPLE)
+                    // SAFETY: as above.
+                    .map(|q| unsafe { tail(HW_BVH_SAMPLES_AT + s * HW_BVH_SAMPLE + q).read_volatile() })
+                    .collect();
+                tracing::warn!(
+                    kind = w[0],
+                    address = format_args!("{:#x}", u64::from(w[1]) | u64::from(w[2]) << 32),
+                    page = format_args!("{:#x}", w[11]),
+                    software = format_args!("{:08x} {:08x} {:08x} {:08x}", w[3], w[4], w[5], w[6]),
+                    hardware = format_args!("{:08x} {:08x} {:08x} {:08x}", w[7], w[8], w[9], w[10]),
+                    "hardware node test: an answer that differs from the software's (VICTORY_HW_BVH_VERIFY)"
+                );
+            }
+        }
+    }
+
     /// Every ten seconds or so, what was used.
     fn report(&mut self) {
         let now = std::time::Instant::now();
@@ -822,6 +898,14 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
+        if victory_shader::emit::host_hw_bvh_active() && hw_bvh_control() & HW_BVH_VERIFY != 0 {
+            tracing::info!(
+                "hardware node test against the software's (VICTORY_HW_BVH_VERIFY), differences per frame:                  16-bit boxes {:.1}, 32-bit boxes {:.1}, triangles {:.1}",
+                s.hw_differ[0] as f64 / frames,
+                s.hw_differ[1] as f64 / frames,
+                s.hw_differ[2] as f64 / frames
+            );
+        }
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \

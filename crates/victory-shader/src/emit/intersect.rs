@@ -266,7 +266,9 @@ impl<'a> Lower<'a> {
     ) -> Vec<V> {
         use super::super::bitcode::Tag;
         use super::super::shader::{
-            MEMORY_FAULTS, MEMORY_PAGES, MEMORY_VA_OFFSET, SLOT_AMD_EXT, SLOT_FAULTS, SLOT_MEMORY,
+            HW_BVH_BOXES, HW_BVH_SAMPLE, HW_BVH_SAMPLES_AT, HW_BVH_TRIANGLES, HW_BVH_VERIFY,
+            MEMORY_FAULTS, MEMORY_HW_BVH_CONTROL, MEMORY_PAGES, MEMORY_VA_OFFSET, SLOT_AMD_EXT,
+            SLOT_FAULTS, SLOT_MEMORY,
         };
 
         let zero = self.s.m.i32(0);
@@ -357,6 +359,24 @@ impl<'a> Lower<'a> {
             let within = self.s.m.bin(lookup_block, Bin::And, low, k64k);
             (page, va_lo, va_hi, within)
         };
+        // What the host lets the hardware test ([`MEMORY_HW_BVH_CONTROL`]);
+        // the tests' shaders have no such dword: everything, no check.
+        let control = if test_base.is_some() {
+            self.s.m.i32(HW_BVH_BOXES | HW_BVH_TRIANGLES)
+        } else {
+            let at = self.s.m.i32(MEMORY_HW_BVH_CONTROL);
+            let one_dword = self.s.m.i8(1);
+            let word = self.s.op(
+                lookup_block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[directory, at, iu, one_dword, align],
+            );
+            let f = self.s.m.extract(lookup_block, word, 0);
+            self.as_int(f)
+        };
         let va_or = self.s.m.bin(lookup_block, Bin::Or, va_lo, va_hi);
         let mapped = self.s.m.cmp(lookup_block, pred::NE, va_or, zero);
         self.s
@@ -407,6 +427,13 @@ impl<'a> Lower<'a> {
             let max_within = self.s.m.select(mapped_block, is_box32, max_box32, max_node64);
             let fits_in_page = self.s.m.cmp(mapped_block, pred::IULE, within, max_within);
             let hw_ok = self.s.m.bin(mapped_block, Bin::And, aligned, fits_in_page);
+            // Only the kinds the host lets the hardware test.
+            let is_tri = self.s.m.cmp(mapped_block, pred::IULT, kind, k4);
+            let (tri_bit, box_bit) = (self.s.m.i32(HW_BVH_TRIANGLES), self.s.m.i32(HW_BVH_BOXES));
+            let kind_bit = self.s.m.select(mapped_block, is_tri, tri_bit, box_bit);
+            let let_through = self.s.m.bin(mapped_block, Bin::And, control, kind_bit);
+            let let_through = self.s.m.cmp(mapped_block, pred::NE, let_through, zero);
+            let hw_ok = self.s.m.bin(mapped_block, Bin::And, hw_ok, let_through);
             let sw_block = self.s.m.new_block();
             self.s
                 .m
@@ -499,7 +526,128 @@ impl<'a> Lower<'a> {
                 &[uav, phase1, iu, iu, idx_v, zero],
             )
         });
-        self.s.m.terminate(hw_block, Term::Br(join));
+        // (`HW_BVH_VERIFY`) The software's answer too: used, and a
+        // difference counted.
+        let mut checked: Option<([V; 4], usize)> = None;
+        if test_base.is_none() {
+            let verify_bit = self.s.m.i32(HW_BVH_VERIFY);
+            let verifying = self.s.m.bin(hw_block, Bin::And, control, verify_bit);
+            let verifying = self.s.m.cmp(hw_block, pred::NE, verifying, zero);
+            let v_head = self.s.m.new_block();
+            self.s
+                .m
+                .terminate(hw_block, Term::CondBr(verifying, v_head, join));
+            self.cur = v_head;
+            let (handle, byte, v_mapped) = self.bvh_memory(low, high, None);
+            let at = NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped: v_mapped,
+            };
+            let v_from = self.cur;
+            let v_pair = self.s.m.bin(v_from, Bin::And, kind, k6);
+            let v_is_box = self.s.m.cmp(v_from, pred::EQ, v_pair, k4);
+            let (v_box, v_tri, v_cmp) = (
+                self.s.m.new_block(),
+                self.s.m.new_block(),
+                self.s.m.new_block(),
+            );
+            self.s
+                .m
+                .terminate(v_from, Term::CondBr(v_is_box, v_box, v_tri));
+            self.cur = v_box;
+            let v_boxes = self.bvh_boxes(at, kind, ray, sort);
+            let v_box_end = self.cur;
+            self.s.m.terminate(v_box_end, Term::Br(v_cmp));
+            self.cur = v_tri;
+            let v_tris = self.bvh_triangle(at, kind, ray);
+            let v_tri_end = self.cur;
+            self.s.m.terminate(v_tri_end, Term::Br(v_cmp));
+            self.cur = v_cmp;
+            let sw: [V; 4] = std::array::from_fn(|k| {
+                let phi = self.s.m.phi(v_cmp, i32t);
+                self.s
+                    .m
+                    .set_phi(phi, vec![(v_boxes[k], v_box_end), (v_tris[k], v_tri_end)]);
+                phi
+            });
+            let mut differs = self.s.m.cmp(v_cmp, pred::NE, sw[0], hw_out[0]);
+            for k in 1..4 {
+                let d = self.s.m.cmp(v_cmp, pred::NE, sw[k], hw_out[k]);
+                differs = self.s.m.bin(v_cmp, Bin::Or, differs, d);
+            }
+            let (v_note, v_done) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s
+                .m
+                .terminate(v_cmp, Term::CondBr(differs, v_note, v_done));
+            // A difference: counted by kind (16-bit box, 32-bit box,
+            // triangle), the first few kept whole.
+            self.cur = v_note;
+            let faults = self.s.root_uav_handle(SLOT_FAULTS);
+            let is_tri = self.s.m.cmp(v_note, pred::IULT, kind, k4);
+            let box_class = self.s.m.bin(v_note, Bin::Sub, kind, k4);
+            let two = self.s.m.i32(2);
+            let class = self.s.m.select(v_note, is_tri, two, box_class);
+            let k1 = self.s.m.i32(1);
+            let slot = self.s.m.bin(v_note, Bin::Add, class, k1);
+            let tail = self.s.m.i32(MEMORY_FAULTS);
+            let slot = self.s.m.bin(v_note, Bin::Add, slot, tail);
+            let k2 = self.s.m.i32(2);
+            let at_count = self.s.m.bin(v_note, Bin::Shl, slot, k2);
+            let add = self.s.m.i32(0);
+            self.s.op(
+                v_note,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[faults, add, at_count, iu, iu, k1],
+            );
+            let kept_at = self.s.m.i32((MEMORY_FAULTS + 7) * 4);
+            let n = self.s.op(
+                v_note,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[faults, add, kept_at, iu, iu, k1],
+            );
+            let room = self.s.m.i32(16);
+            let keep = self.s.m.cmp(v_note, pred::IULT, n, room);
+            let (v_keep, v_kept) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s
+                .m
+                .terminate(v_note, Term::CondBr(keep, v_keep, v_kept));
+            self.cur = v_keep;
+            let size = self.s.m.i32(HW_BVH_SAMPLE * 4);
+            let first = self.s.m.i32((MEMORY_FAULTS + HW_BVH_SAMPLES_AT) * 4);
+            let off = self.s.m.bin(v_keep, Bin::Mul, n, size);
+            let off = self.s.m.bin(v_keep, Bin::Add, off, first);
+            let words = [kind, low, high, sw[0], sw[1], sw[2], sw[3], hw_out[0], hw_out[1], hw_out[2], hw_out[3], page];
+            let all = self.s.m.i8(15);
+            for (q, chunk) in words.chunks(4).enumerate() {
+                let at = self.s.m.i32(q as u32 * 16);
+                let at = self.s.m.bin(v_keep, Bin::Add, off, at);
+                self.s.op(
+                    v_keep,
+                    "rawBufferStore.i32",
+                    Attr::NoUnwind,
+                    self.s.t.void,
+                    140,
+                    &[faults, at, iu, chunk[0], chunk[1], chunk[2], chunk[3], all, align],
+                );
+            }
+            self.s.m.terminate(v_keep, Term::Br(v_kept));
+            self.cur = v_kept;
+            self.s.m.terminate(v_kept, Term::Br(v_done));
+            self.cur = v_done;
+            self.s.m.terminate(v_done, Term::Br(join));
+            checked = Some((sw, v_done));
+        } else {
+            self.s.m.terminate(hw_block, Term::Br(join));
+        }
 
         // Join all paths.
         self.cur = join;
@@ -511,6 +659,9 @@ impl<'a> Lower<'a> {
                 (miss_vals[k], miss_block),
                 (hw_out[k], hw_block),
             ];
+            if let Some((vals, blk)) = checked {
+                inc.push((vals[k], blk));
+            }
             for &(vals, blk) in &sw_incoming {
                 inc.push((vals[k], blk));
             }
