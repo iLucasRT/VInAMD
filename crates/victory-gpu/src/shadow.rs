@@ -5646,14 +5646,28 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // With tails or a finer grid the window to take is chosen among those
+    // there; that choice is made under the shared lock too (it was made
+    // only under the write lock, which every list thread then queued for:
+    // 16.5% of their time in profile belobug-9), and the write lock is
+    // taken only to make a window.
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).or(Some(named))
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
             note(shadow);
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -5670,13 +5684,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // The window is made without the lock (driver calls: every reader
+    // queued behind them, 15.6% of the list threads in profile belobug-10)
+    // and put in after, unless another thread put the same one in meanwhile.
+    drop(map);
+    let finish = |shadow: Arc<Shadow>| -> Option<Arc<Shadow>> {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(theirs) = map.get(&(start, len)) {
+            note(theirs);
+            return Some(theirs.clone());
+        }
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        Some(shadow)
+    };
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return finish(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
@@ -5687,9 +5713,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         shadow.window = true;
         shadow.mapped = true;
         let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return finish(shadow);
     }
     // In the card's memory when there is room (`Host::window_buffer`): then
     // no second copy on the card.
@@ -5727,15 +5751,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    finish(shadow)
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: RwLock<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>> = RwLock::new(BTreeMap::new());
+
+/// The askings of [`exact`] so far (its clock for "not asked for lately").
+static EXACT_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// The size of [`EXACT`]'s map at which its next sweep comes.
+static EXACT_SWEEP_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -5767,28 +5795,50 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
+    let now = EXACT_TICK.fetch_add(1, Ordering::Relaxed) + 1;
+    // Found (nearly always): under the shared lock, so that list threads
+    // asking at once do not queue (6.7% of their time in profile belobug-10).
+    {
+        let map = EXACT.read().unwrap_or_else(|e| e.into_inner());
+        if let Some((shadow, used)) = map.get(&(address, len)) {
+            used.store(now, Ordering::Relaxed);
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((shadow, used)) = map.get(&(address, len)) {
+        used.store(now, Ordering::Relaxed);
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    // The sweep looks at every copy kept (two COM calls each) under the
+    // lock every list thread takes here: done on every miss, with ~2,700
+    // kept, it was a fifth of the list threads' time (profile belobug-6).
+    // Now only once the map has doubled since the last sweep.
+    if map.len() >= EXACT_SWEEP_AT.load(Ordering::Relaxed).max(MANY) {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
         map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || used.load(Ordering::Relaxed) + LATELY > now
         });
+        EXACT_SWEEP_AT.store((map.len() * 2).max(MANY), Ordering::Relaxed);
     }
+    // The host buffer is made without the lock (a driver call), and the
+    // map asked again after: a thread that made the same copy meanwhile wins.
+    drop(map);
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut map = EXACT.write().unwrap_or_else(|e| e.into_inner());
+    if let Some((theirs, used)) = map.get(&(address, len)) {
+        used.store(now, Ordering::Relaxed);
+        theirs.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(theirs.clone());
+    }
+    map.insert((address, len), (shadow.clone(), AtomicU64::new(now)));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5805,7 +5855,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
