@@ -750,7 +750,7 @@ impl<'a> Lower<'a> {
             let words = [
                 kind, low, high, sw[0], sw[1], sw[2], sw[3], hw_out[0], hw_out[1], hw_out[2], hw_out[3], page,
                 ray_words[0], ray_words[1], ray_words[2], ray_words[3], ray_words[4], ray_words[5],
-                ray_words[6], ray_words[7], ray_words[8], ray_words[9], zero, zero,
+                ray_words[6], ray_words[7], ray_words[8], ray_words[9], va_lo, va_hi,
             ];
             let all = self.s.m.i8(15);
             for (q, chunk) in words.chunks(4).enumerate() {
@@ -765,7 +765,25 @@ impl<'a> Lower<'a> {
                     &[faults, at, iu, chunk[0], chunk[1], chunk[2], chunk[3], all, align],
                 );
             }
-            self.s.m.terminate(v_keep, Term::Br(v_kept));
+            // The node's 128 bytes as the software reads them.
+            let mut node = self.bvh_node_words(at, None, 0, 16);
+            let second = self.bvh_second_half(at);
+            node.extend(self.bvh_node_words(second, None, 0, 16));
+            for (q, chunk) in node.chunks(4).enumerate() {
+                let c = self.cur;
+                let to = self.s.m.i32(24 * 4 + q as u32 * 16);
+                let to = self.s.m.bin(c, Bin::Add, off, to);
+                self.s.op(
+                    c,
+                    "rawBufferStore.i32",
+                    Attr::NoUnwind,
+                    self.s.t.void,
+                    140,
+                    &[faults, to, iu, chunk[0], chunk[1], chunk[2], chunk[3], all, align],
+                );
+            }
+            let keep_end = self.cur;
+            self.s.m.terminate(keep_end, Term::Br(v_kept));
             self.cur = v_kept;
             self.s.m.terminate(v_kept, Term::Br(v_done));
             self.cur = v_done;

@@ -117,8 +117,10 @@ pub const HW_BVH_GROW: u32 = 32;
 pub const HW_BVH_TAIL: u32 = 8 + 16 * HW_BVH_SAMPLE;
 /// Dwords of one kept difference ([`HW_BVH_VERIFY`]): kind, address low and
 /// high, the software's four, the hardware's four, the page; the ray's
-/// origin, direction, inverse direction and extent; two unused.
-pub const HW_BVH_SAMPLE: u32 = 24;
+/// origin, direction, inverse direction and extent; the host GPU address the
+/// hardware read (low, high); then the node's 128 bytes as the software read
+/// them (32 dwords); eight unused.
+pub const HW_BVH_SAMPLE: u32 = 64;
 /// Dword of the tail past [`MEMORY_FAULTS`] that counts box answers with the
 /// same children in another order ([`HW_BVH_VERIFY`]; dwords 1-3 count
 /// those with other children, and triangles).

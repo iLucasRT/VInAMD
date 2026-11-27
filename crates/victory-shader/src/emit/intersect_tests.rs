@@ -433,6 +433,32 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
             }
         }
     }
+    // Rays as run YP38b caught the card missing boxes the software enters:
+    // far from the origin, a long direction, a short extent (32-bit boxes:
+    // 16-bit floats hold none of these coordinates).
+    for (origin, direction) in [
+        ([4096.3594f32, 4096.2734, 176128.0], [-649.937f32, 92.43466, -12574.144]),
+        ([-12287.641, -28671.727, 12287.992], [-712.82745, -703.2866, 3425.678]),
+    ] {
+        let along = |t: f32, half: f32| -> [f32; 6] {
+            std::array::from_fn(|k| origin[k % 3] + t * direction[k % 3] + if k < 3 { -half } else { half })
+        };
+        let ids = [0x7005, 0x700d, 0x7015, 0x701d];
+        let ray = Ray::new(origin, direction, 20.0);
+        // The same ray with a unit direction and the extent in its units:
+        // if the card answers this one and not the other, it is the
+        // direction's length.
+        let length = direction.iter().map(|d| d * d).sum::<f32>().sqrt();
+        let unit = Ray::new(origin, direction.map(|d| d / length), 20.0 * length);
+        for boxes in [
+            [along(2.0, 400.0), along(8.0, 400.0), along(15.0, 2000.0), along(25.0, 400.0)],
+            [along(0.0, 1000.0), along(1.0, 100.0), along(10.0, 5000.0), along(18.0, 50.0)],
+        ] {
+            let n = s.add(nodes::box32(ids, boxes), 32);
+            cases.push(Some((n, 5, ray)));
+            cases.push(Some((n, 5, unit)));
+        }
+    }
     // Kinds the instruction does not read, and threads masked out.
     let ray = Ray::new([0.0; 3], [0.0, 0.0, 1.0], 100.0);
     cases.extend([

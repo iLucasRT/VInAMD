@@ -899,6 +899,16 @@ impl Memory {
                     direction = format_args!("{} {} {}", f(15), f(16), f(17)),
                     inverse = format_args!("{} {} {}", f(18), f(19), f(20)),
                     extent = f(21),
+                    read_at = format_args!("{:#x}", u64::from(w[22]) | u64::from(w[23]) << 32),
+                    children = format_args!("{:08x} {:08x} {:08x} {:08x}", w[24], w[25], w[26], w[27]),
+                    boxes = format_args!(
+                        "{:?}",
+                        (0..4)
+                            .map(|b| (0..6).map(|k| f(28 + 6 * b + k)).collect::<Vec<f32>>())
+                            .collect::<Vec<_>>()
+                    ),
+                    words_28_31_after_boxes = format_args!("{:08x} {:08x} {:08x} {:08x}", w[52], w[53], w[54], w[55]),
+                    node = format_args!("{:08x?}", &w[24..56]),
                     "hardware node test: an answer that differs from the software's (VICTORY_HW_BVH_VERIFY)"
                 );
             }
