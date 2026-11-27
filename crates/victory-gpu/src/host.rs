@@ -5053,6 +5053,8 @@ impl Host {
                 .collect();
         }
         land::spent(land::stat::GATHER, gathering);
+        #[cfg(feature = "diagnostics")]
+        land::by_buffer(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span(), (hi - lo) as u64)));
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }

@@ -151,7 +151,9 @@ fn build() -> [u8; 32] {
     // before `Host::create()` cannot lock in a stale off state.
     if victory_shader::emit::host_hw_bvh_active() {
         // (`;control`: the lowering that reads `MEMORY_HW_BVH_CONTROL`.)
-        hash.update(b"VICTORY_HW_BVH=1;control;tries;node;fallback");
+        hash.update(b"VICTORY_HW_BVH=1;control;tries;node;fallback;lean");
+        // Which optional parts the lowering holds (`hw_bvh_code_bits`).
+        hash.update(&victory_shader::emit::hw_bvh_code_bits().to_le_bytes());
         hash.update(&[victory_shader::emit::host_hw_bvh_opcode()]);
     }
     *hash.finalize().as_bytes()

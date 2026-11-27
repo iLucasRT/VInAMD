@@ -131,8 +131,50 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
     now
 }
 
+/// (Diagnostics) Bytes fetched to land since the last line, by the title
+/// buffer they belong to (its start and length): bytes, pieces.
+#[cfg(feature = "diagnostics")]
+static BY_BUFFER: Mutex<Option<std::collections::HashMap<(u64, u64), (u64, u64)>>> = Mutex::new(None);
+
+/// (Diagnostics) Notes what a landing fetches, by title buffer.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn by_buffer(pieces: impl Iterator<Item = ((u64, u64), u64)>) {
+    let mut map = BY_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Default::default);
+    for (span, bytes) in pieces {
+        let e = map.entry(span).or_default();
+        e.0 += bytes;
+        e.1 += 1;
+    }
+}
+
+/// (Diagnostics) The title buffers most of the landing's bytes come from.
+#[cfg(feature = "diagnostics")]
+fn log_by_buffer(frames: f64) {
+    let Some(map) = BY_BUFFER.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let all: u64 = map.values().map(|v| v.0).sum();
+    let mut top: Vec<((u64, u64), (u64, u64))> = map.into_iter().collect();
+    top.sort_by_key(|&(_, (bytes, _))| std::cmp::Reverse(bytes));
+    let mb = |v: u64| v as f64 / (1 << 20) as f64 / frames;
+    let list: Vec<String> = top
+        .iter()
+        .take(16)
+        .map(|&((start, len), (bytes, pieces))| {
+            format!("{start:#x}+{:.1}MB: {:.1} MB/frame in {:.0} pieces", len as f64 / (1 << 20) as f64, mb(bytes), pieces as f64 / frames)
+        })
+        .collect();
+    tracing::info!(
+        "landing by title buffer per frame: {:.1} MB from {} buffers; the most: {}",
+        mb(all),
+        top.len(),
+        list.join("; ")
+    );
+}
+
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    log_by_buffer(frames);
     let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if t[0] > 0.0 {
         tracing::info!(

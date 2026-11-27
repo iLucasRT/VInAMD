@@ -119,7 +119,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{
-    host_hw_bvh_active, host_hw_bvh_opcode, host_settings, hw_bvh_switch, set_host_hw_bvh,
+    host_hw_bvh_active, host_hw_bvh_opcode, host_settings, hw_bvh_code_bits, hw_bvh_switch, set_host_hw_bvh,
     set_host_max_wave, set_host_rdna, set_thread_max_wave,
 };
 pub use rect::rect_list_gs;

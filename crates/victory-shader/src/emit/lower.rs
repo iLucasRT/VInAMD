@@ -1563,6 +1563,33 @@ pub fn host_hw_bvh_active() -> bool {
     host_hw_bvh_opcode() != 0
 }
 
+/// Which optional parts the hardware node test's lowering holds, read once
+/// from the environment the translation runs in: the bits of
+/// [`super::shader::MEMORY_HW_BVH_CONTROL`] for `VICTORY_HW_BVH_VERIFY`,
+/// `_CLAMP_INVERSE`, `_NORMALIZE` and `_GROW` (each `=1` to have its code).
+/// Without them only the card's test and the software fallback for boxes it
+/// answers empty are there: every part costs registers in every program that
+/// walks the structures, wanted or not (the capture of run YP42: those
+/// programs at 256 registers a lane and spilling 1.6-3.7 KB, one of them
+/// 760 KB of code). The shader cache keys on the bits.
+pub fn hw_bvh_code_bits() -> u32 {
+    use super::shader::{HW_BVH_CLAMP_INVERSE, HW_BVH_GROW, HW_BVH_NORMALIZE, HW_BVH_VERIFY};
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v != "0");
+        [
+            ("VICTORY_HW_BVH_VERIFY", HW_BVH_VERIFY),
+            ("VICTORY_HW_BVH_CLAMP_INVERSE", HW_BVH_CLAMP_INVERSE),
+            ("VICTORY_HW_BVH_NORMALIZE", HW_BVH_NORMALIZE),
+            ("VICTORY_HW_BVH_GROW", HW_BVH_GROW),
+        ]
+        .into_iter()
+        .filter(|&(name, _)| on(name))
+        .map(|(_, bit)| bit)
+        .sum()
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`host_hw_bvh`], for its thread only (`0` = off).

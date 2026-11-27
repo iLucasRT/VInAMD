@@ -491,6 +491,8 @@ impl<'a> Lower<'a> {
         let phase1 = self.s.m.i32(0x5100_0000 | u32::from(opcode));
         // AmdExtIntersectBvhNodeFlag_BoxSortEnable (1) | ReturnBarycentrics (2)
         let flags_val = self.s.m.i32(u32::from(sort) | 2);
+        // The optional parts this translation holds (`hw_bvh_code_bits`).
+        let code = super::hw_bvh_code_bits();
         let bit_set = |l: &mut Self, bit: u32| {
             let b = l.s.m.i32(bit);
             let on = l.s.m.bin(hw_block, Bin::And, control, b);
@@ -504,6 +506,9 @@ impl<'a> Lower<'a> {
         );
         let inverse: [V; 3] = std::array::from_fn(|a| {
             let x = ray.inverse[a];
+            if code & HW_BVH_CLAMP_INVERSE == 0 {
+                return x;
+            }
             let held = self.binary(35, x, least);
             let held = self.binary(36, held, most);
             self.s.m.select(hw_block, clamping, held, x)
@@ -513,7 +518,11 @@ impl<'a> Lower<'a> {
         let (k23, kff) = (self.s.m.i32(23), self.s.m.i32(0xFF));
         let grow = self.s.m.bin(hw_block, Bin::LShr, word1, k23);
         let grow = self.s.m.bin(hw_block, Bin::And, grow, kff);
-        let expansion = self.s.m.select(hw_block, growing, grow, zero);
+        let expansion = if code & HW_BVH_GROW == 0 {
+            zero
+        } else {
+            self.s.m.select(hw_block, growing, grow, zero)
+        };
         let inputs: [V; 14] = [
             ptr_lo,
             ptr_hi,
@@ -554,7 +563,9 @@ impl<'a> Lower<'a> {
         });
         // (`HW_BVH_NORMALIZE`) A triangle's answer in the software's form.
         let hw_raw = hw_out;
-        let hw_out: [V; 4] = {
+        let hw_out: [V; 4] = if code & HW_BVH_NORMALIZE == 0 {
+            hw_raw
+        } else {
             let normalizing = {
                 let b = self.s.m.i32(HW_BVH_NORMALIZE);
                 let on = self.s.m.bin(hw_block, Bin::And, control, b);
@@ -649,7 +660,7 @@ impl<'a> Lower<'a> {
         // (`HW_BVH_VERIFY`) The software's answer too: used, and a
         // difference counted.
         let mut checked: Option<([V; 4], usize)> = None;
-        if test_base.is_none() {
+        if test_base.is_none() && code & HW_BVH_VERIFY != 0 {
             let verify_bit = self.s.m.i32(HW_BVH_VERIFY);
             let verifying = self.s.m.bin(hw_block, Bin::And, control, verify_bit);
             let verifying = self.s.m.cmp(hw_block, pred::NE, verifying, zero);
