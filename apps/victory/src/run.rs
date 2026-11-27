@@ -234,6 +234,14 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // What the title asks for by name (VICTORY_TITLE_NAMES=<file>): its
+    // visual tunables with their values, and the shader effects it loads.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::title_names::apply_asked(image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

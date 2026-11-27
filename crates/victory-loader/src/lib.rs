@@ -40,6 +40,8 @@ mod threads;
 #[cfg(windows)]
 mod thunks;
 #[cfg(windows)]
+pub mod title_names;
+#[cfg(windows)]
 mod tls;
 #[cfg(windows)]
 pub mod write_sites;
