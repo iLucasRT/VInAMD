@@ -239,9 +239,13 @@ fn log_by_buffer(frames: f64) {
         })
         .collect();
     let kinds = BY_KIND.each_ref().map(|k| k.swap(0, Ordering::Relaxed));
+    let card = crate::cardonly::report();
+    let whole = |v: u64| v as f64 / (1 << 20) as f64;
     tracing::info!(
         "landing by title buffer per frame: {:.1} MB from {} buffers; by the title's protection: write-combined {:.1} MB, \
-         uncached {:.1}, GPU-coherent {:.1}, other {:.1}, not known {:.1}; left on the card (VICTORY_LAND_SKIP_WC) {:.1} MB; the most: {}",
+         uncached {:.1}, GPU-coherent {:.1}, other {:.1}, not known {:.1}; left on the card (VICTORY_LAND_SKIP_WC) {:.1} MB; \
+         held only on the card now {:.1} MB in {} copies, since the last line: idle copies kept to land first {}, landed for \
+         them or for copies over them {:.1} MB, new copies over held bytes {}, copies gone holding some {} ({:.1} MB); the most: {}",
         mb(all),
         top.len(),
         mb(kinds[0]),
@@ -250,6 +254,13 @@ fn log_by_buffer(frames: f64) {
         mb(kinds[3]),
         mb(kinds[4]),
         mb(SKIPPED_WC.swap(0, Ordering::Relaxed)),
+        whole(card[0]),
+        card[1],
+        card[2],
+        whole(card[3]),
+        card[4],
+        card[5],
+        whole(card[6]),
         list.join("; ")
     );
 }

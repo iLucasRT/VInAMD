@@ -2738,6 +2738,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.card.is_some() {
+            crate::cardonly::gone(self.id, self.start, self.len);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3151,6 +3154,18 @@ pub(crate) fn let_go_idle() {
                 .collect();
             window_victims(&entries, keep)
         };
+        // A copy holding bytes only on the card (`VICTORY_LAND_SKIP_WC`)
+        // stays until the next landing has put them into title memory.
+        let victims: Vec<usize> = victims
+            .into_iter()
+            .filter(|&i| match map.get(&eligible[i].1) {
+                Some(s) if crate::cardonly::holds(s) => {
+                    crate::cardonly::kept(s);
+                    false
+                }
+                _ => true,
+            })
+            .collect();
         victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
     };
     if !gone.is_empty() {
@@ -3288,6 +3303,13 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        let id = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        };
+        // A copy made over bytes another holds only on the card
+        // (`VICTORY_LAND_SKIP_WC`): their holder is asked to land them.
+        crate::cardonly::made(start, len, id);
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
@@ -3309,10 +3331,7 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id,
             card: None,
             window: false,
             changes_only: Default::default(),

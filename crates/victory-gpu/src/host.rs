@@ -5028,6 +5028,8 @@ impl Host {
                             // to be write-combined stays on the card.
                             if land::skip_write_combined() && land::write_combined(r.shadow.span().0 + lo as u64) {
                                 land::skipped_write_combined((hi - lo) as u64);
+                                // Kept, for a copy let go or made over it.
+                                crate::cardonly::note(&r.shadow, lo, hi);
                                 continue;
                             }
                             if upcheck::on() {
@@ -5041,6 +5043,20 @@ impl Host {
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
+        }
+        // Pieces left on the card (`crate::cardonly`) of copies about to be
+        // let go or that a new copy lies over: fetched with these.
+        let mut on_demand: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        for shadow in crate::cardonly::take_wanted() {
+            let wanted = crate::cardonly::pieces_of(&shadow);
+            for &(lo, hi) in &wanted {
+                let (lo, hi) = (lo, hi.min(shadow.span().1 as usize));
+                if lo < hi && !pieces.iter().any(|(s, a, b, _)| std::sync::Arc::ptr_eq(s, &shadow) && *a == lo && *b == hi) {
+                    pieces.push((shadow.clone(), lo, hi, total));
+                    total += (hi - lo) as u64;
+                }
+            }
+            on_demand.push((shadow, wanted));
         }
         if land::on() {
             // In the order they are landed, each byte of a copy once.
@@ -5247,6 +5263,9 @@ impl Host {
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+        for (shadow, landed) in &on_demand {
+            crate::cardonly::landed(shadow, landed);
+        }
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first

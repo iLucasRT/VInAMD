@@ -60,6 +60,8 @@ pub mod port_descriptors;
 #[cfg(windows)]
 mod port_journal;
 #[cfg(windows)]
+mod cardonly;
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;
