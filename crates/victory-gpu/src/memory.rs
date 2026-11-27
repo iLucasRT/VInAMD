@@ -70,7 +70,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{
-    HW_BVH_BOXES, HW_BVH_CLAMP_INVERSE, HW_BVH_GROW, HW_BVH_NORMALIZE, HW_BVH_ORDER_ONLY,
+    HW_BVH_BOXES, HW_BVH_CLAMP_INVERSE, HW_BVH_EXTRA_ONLY, HW_BVH_FALLBACK_EMPTY, HW_BVH_GROW,
+    HW_BVH_NORMALIZE, HW_BVH_ORDER_ONLY,
     HW_BVH_SAMPLE, HW_BVH_SAMPLES_AT, HW_BVH_TAIL, HW_BVH_TRIANGLES, HW_BVH_VERIFY,
     MEMORY_FAULTS, MEMORY_HW_BVH_CONTROL, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_VA_OFFSET,
 };
@@ -221,9 +222,10 @@ struct Stats {
     came: [u64; 4],
     micros: u64,
     /// (`VICTORY_HW_BVH_VERIFY=1`) Nodes the hardware answered otherwise than
-    /// the software: 16-bit boxes, 32-bit boxes (other children), triangles,
-    /// and boxes with the same children in another order.
-    hw_differ: [u64; 4],
+    /// the software: 16-bit boxes and 32-bit boxes that leave out a child the
+    /// software keeps, triangles, boxes with the same children in another
+    /// order, boxes with more children (ties at the extent).
+    hw_differ: [u64; 5],
 }
 
 /// (`VICTORY_HW_BVH=1`) What the shaders let the card's hardware test, read
@@ -245,6 +247,7 @@ fn hw_bvh_control() -> u32 {
         | bit("VICTORY_HW_BVH_CLAMP_INVERSE", HW_BVH_CLAMP_INVERSE)
         | bit("VICTORY_HW_BVH_NORMALIZE", HW_BVH_NORMALIZE)
         | bit("VICTORY_HW_BVH_GROW", HW_BVH_GROW)
+        | bit("VICTORY_HW_BVH_FALLBACK_EMPTY", HW_BVH_FALLBACK_EMPTY)
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -282,6 +285,7 @@ impl Memory {
                 clamp_inverse = control & HW_BVH_CLAMP_INVERSE != 0,
                 normalize = control & HW_BVH_NORMALIZE != 0,
                 grow = control & HW_BVH_GROW != 0,
+                fallback_empty = control & HW_BVH_FALLBACK_EMPTY != 0,
                 "hardware node test: what it tests and how (VICTORY_HW_BVH_KINDS, _VERIFY, _CLAMP_INVERSE, _NORMALIZE, _GROW)"
             );
         }
@@ -870,7 +874,11 @@ impl Memory {
             unsafe { self.faults.1.add((MEMORY_FAULTS + i) as usize) }
         };
         for (k, sum) in self.stats.hw_differ.iter_mut().enumerate() {
-            let at = tail(if k < 3 { 1 + k as u32 } else { HW_BVH_ORDER_ONLY });
+            let at = tail(match k {
+                0..3 => 1 + k as u32,
+                3 => HW_BVH_ORDER_ONLY,
+                _ => HW_BVH_EXTRA_ONLY,
+            });
             // SAFETY: as above.
             let n = unsafe { at.read_volatile() };
             if n != 0 {
@@ -926,10 +934,11 @@ impl Memory {
         let s = std::mem::take(&mut self.stats);
         if victory_shader::emit::host_hw_bvh_active() && hw_bvh_control() & HW_BVH_VERIFY != 0 {
             tracing::info!(
-                "hardware node test against the software's (VICTORY_HW_BVH_VERIFY), differences per frame: boxes with other children: 16-bit {:.1}, 32-bit {:.1}; boxes with the same children in another order {:.1}; triangles {:.1}",
+                "hardware node test against the software's (VICTORY_HW_BVH_VERIFY), differences per frame: boxes that leave out a child: 16-bit {:.1}, 32-bit {:.1}; harmless: the same children in another order {:.1}, more children (ties at the extent) {:.1}; triangles {:.1}",
                 s.hw_differ[0] as f64 / frames,
                 s.hw_differ[1] as f64 / frames,
                 s.hw_differ[3] as f64 / frames,
+                s.hw_differ[4] as f64 / frames,
                 s.hw_differ[2] as f64 / frames
             );
         }

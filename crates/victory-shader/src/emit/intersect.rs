@@ -267,7 +267,8 @@ impl<'a> Lower<'a> {
     ) -> Vec<V> {
         use super::super::bitcode::Tag;
         use super::super::shader::{
-            HW_BVH_BOXES, HW_BVH_CLAMP_INVERSE, HW_BVH_GROW, HW_BVH_NORMALIZE, HW_BVH_ORDER_ONLY,
+            HW_BVH_BOXES, HW_BVH_CLAMP_INVERSE, HW_BVH_EXTRA_ONLY, HW_BVH_FALLBACK_EMPTY, HW_BVH_GROW,
+            HW_BVH_NORMALIZE, HW_BVH_ORDER_ONLY,
             HW_BVH_SAMPLE, HW_BVH_SAMPLES_AT, HW_BVH_TRIANGLES, HW_BVH_VERIFY,
             MEMORY_FAULTS, MEMORY_HW_BVH_CONTROL, MEMORY_PAGES, MEMORY_VA_OFFSET, SLOT_AMD_EXT,
             SLOT_FAULTS, SLOT_MEMORY,
@@ -579,6 +580,15 @@ impl<'a> Lower<'a> {
             let inf_t = self.s.m.cmp(hw_block, pred::OEQ, atn, inf);
             let flat = self.s.m.cmp(hw_block, pred::OEQ, ad, fzero);
             let missed = self.s.m.bin(hw_block, Bin::Or, inf_t, flat);
+            // A quotient that is not finite (a tiny denominator) is a miss
+            // too: a NaN or an infinity in the light spreads from frame to
+            // frame (run YP39's black blotches).
+            let mut missed = missed;
+            for x in [t, i, j] {
+                let a = self.unary(6, x);
+                let bad = self.s.m.cmp(hw_block, pred::UGE, a, inf);
+                missed = self.s.m.bin(hw_block, Bin::Or, missed, bad);
+            }
             let form = [
                 self.s.m.select(hw_block, missed, inf, t),
                 self.s.m.select(hw_block, missed, one, sign),
@@ -589,6 +599,51 @@ impl<'a> Lower<'a> {
                 let v = self.as_int(form[k]);
                 self.s.m.select(hw_block, normalizing, v, hw_raw[k])
             })
+        };
+
+        // (`HW_BVH_FALLBACK_EMPTY`) A box the card finds no child of: the
+        // software's answer instead.
+        let (hw_out, hw_block): ([V; 4], usize) = if test_base.is_none() {
+            let on = {
+                let b = self.s.m.i32(HW_BVH_FALLBACK_EMPTY);
+                let on = self.s.m.bin(hw_block, Bin::And, control, b);
+                self.s.m.cmp(hw_block, pred::NE, on, zero)
+            };
+            let pair = self.s.m.bin(hw_block, Bin::And, kind, k6);
+            let is_box = self.s.m.cmp(hw_block, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            let mut empty = self.s.m.cmp(hw_block, pred::EQ, hw_out[0], none);
+            for &v in &hw_out[1..] {
+                let e = self.s.m.cmp(hw_block, pred::EQ, v, none);
+                empty = self.s.m.bin(hw_block, Bin::And, empty, e);
+            }
+            let go = self.s.m.bin(hw_block, Bin::And, on, is_box);
+            let go = self.s.m.bin(hw_block, Bin::And, go, empty);
+            let (fb, merge) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s.m.terminate(hw_block, Term::CondBr(go, fb, merge));
+            self.cur = fb;
+            let (handle, byte, fb_mapped) = self.bvh_memory(low, high, None);
+            let at = NodeAt::Memory {
+                handle,
+                byte,
+                low,
+                high,
+                mapped: fb_mapped,
+            };
+            let fb_boxes = self.bvh_boxes(at, kind, ray, sort);
+            let fb_end = self.cur;
+            self.s.m.terminate(fb_end, Term::Br(merge));
+            self.cur = merge;
+            let out: [V; 4] = std::array::from_fn(|k| {
+                let phi = self.s.m.phi(merge, i32t);
+                self.s
+                    .m
+                    .set_phi(phi, vec![(hw_out[k], hw_block), (fb_boxes[k], fb_end)]);
+                phi
+            });
+            (out, merge)
+        } else {
+            (hw_out, hw_block)
         };
 
         // (`HW_BVH_VERIFY`) The software's answer too: used, and a
@@ -643,10 +698,12 @@ impl<'a> Lower<'a> {
                 let d = self.s.m.cmp(v_cmp, pred::NE, sw[k], hw_out[k]);
                 differs = self.s.m.bin(v_cmp, Bin::Or, differs, d);
             }
-            // For a box: the same children in another order? Every one of
-            // either answer is in the other.
-            let mut same_set: Option<V> = None;
-            for (a, b) in [(sw, hw_out), (hw_out, sw)] {
+            // For a box: is every child of one answer in the other? Both
+            // ways: the same children (in another order); the software's
+            // in the card's: the card keeps more (a box reached exactly at
+            // the extent), harmless; otherwise the card leaves one out.
+            let mut within = [None::<V>; 2];
+            for (n, (a, b)) in [(sw, hw_out), (hw_out, sw)].into_iter().enumerate() {
                 for &x in a.iter() {
                     let mut found: Option<V> = None;
                     for &y in b.iter() {
@@ -657,15 +714,16 @@ impl<'a> Lower<'a> {
                         });
                     }
                     let found = found.expect("four");
-                    same_set = Some(match same_set {
+                    within[n] = Some(match within[n] {
                         Some(s) => self.s.m.bin(v_cmp, Bin::And, s, found),
                         None => found,
                     });
                 }
             }
-            let same_set = same_set.expect("eight");
+            let (sw_kept, hw_kept) = (within[0].expect("four"), within[1].expect("four"));
+            let same_set = self.s.m.bin(v_cmp, Bin::And, sw_kept, hw_kept);
             let is_box_kind = self.s.m.cmp(v_cmp, pred::IUGE, kind, k4);
-            let order_only = self.s.m.bin(v_cmp, Bin::And, same_set, is_box_kind);
+            let order_only = self.s.m.bin(v_cmp, Bin::And, sw_kept, is_box_kind);
             let order_only = self.s.m.bin(v_cmp, Bin::And, order_only, differs);
             let (v_order, v_other) = (self.s.m.new_block(), self.s.m.new_block());
             self.s
@@ -674,7 +732,11 @@ impl<'a> Lower<'a> {
             self.cur = v_order;
             {
                 let faults = self.s.root_uav_handle(SLOT_FAULTS);
-                let at = self.s.m.i32((MEMORY_FAULTS + HW_BVH_ORDER_ONLY) * 4);
+                let (reordered, extra) = (
+                    self.s.m.i32((MEMORY_FAULTS + HW_BVH_ORDER_ONLY) * 4),
+                    self.s.m.i32((MEMORY_FAULTS + HW_BVH_EXTRA_ONLY) * 4),
+                );
+                let at = self.s.m.select(v_order, same_set, reordered, extra);
                 let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
                 self.s.op(
                     v_order,

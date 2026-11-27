@@ -112,6 +112,11 @@ pub const HW_BVH_NORMALIZE: u32 = 16;
 /// Bit of [`MEMORY_HW_BVH_CONTROL`]: the hardware's box test grows the boxes
 /// by the descriptor's own amount (dword 1 bits 23-30), not by none.
 pub const HW_BVH_GROW: u32 = 32;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: a box node the hardware finds no child
+/// of is tested in software, and the software's answer is used (run YP38b:
+/// the card's harmful differences were boxes it answered empty and the
+/// software did not).
+pub const HW_BVH_FALLBACK_EMPTY: u32 = 64;
 /// Dwords of the [`SLOT_FAULTS`] buffer past [`MEMORY_FAULTS`] for
 /// [`HW_BVH_VERIFY`].
 pub const HW_BVH_TAIL: u32 = 8 + 16 * HW_BVH_SAMPLE;
@@ -125,6 +130,11 @@ pub const HW_BVH_SAMPLE: u32 = 64;
 /// same children in another order ([`HW_BVH_VERIFY`]; dwords 1-3 count
 /// those with other children, and triangles).
 pub const HW_BVH_ORDER_ONLY: u32 = 4;
+/// Dword of the tail past [`MEMORY_FAULTS`] that counts box answers holding
+/// every child the software's holds and more ([`HW_BVH_VERIFY`]: the card
+/// keeps a box the ray reaches exactly at its extent; harmless). Dwords 1-3
+/// then count only answers that leave out a child the software's has.
+pub const HW_BVH_EXTRA_ONLY: u32 = 5;
 /// Where in the tail the kept differences start ([`HW_BVH_VERIFY`]); dword 7
 /// of the tail counts them.
 pub const HW_BVH_SAMPLES_AT: u32 = 8;
