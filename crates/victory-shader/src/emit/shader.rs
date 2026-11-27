@@ -99,11 +99,30 @@ pub const HW_BVH_TRIANGLES: u32 = 2;
 /// that tail on: kind, address low and high, the software's four, the
 /// hardware's four).
 pub const HW_BVH_VERIFY: u32 = 4;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: the hardware is given the inverse
+/// direction held finite, as the software test holds it (an infinite one, of
+/// a direction component of 0, makes a NaN of an origin on a box's face).
+pub const HW_BVH_CLAMP_INVERSE: u32 = 8;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: the hardware's answer for a triangle is
+/// put in the software's form: numerator and barycentrics over the
+/// denominator's magnitude, the denominator's sign, and a miss as
+/// `(+inf, 1, 0, 0)` (the hardware gives the raw determinant, and a miss as
+/// minus infinity over it).
+pub const HW_BVH_NORMALIZE: u32 = 16;
+/// Bit of [`MEMORY_HW_BVH_CONTROL`]: the hardware's box test grows the boxes
+/// by the descriptor's own amount (dword 1 bits 23-30), not by none.
+pub const HW_BVH_GROW: u32 = 32;
 /// Dwords of the [`SLOT_FAULTS`] buffer past [`MEMORY_FAULTS`] for
 /// [`HW_BVH_VERIFY`].
 pub const HW_BVH_TAIL: u32 = 8 + 16 * HW_BVH_SAMPLE;
-/// Dwords of one kept difference ([`HW_BVH_VERIFY`]).
-pub const HW_BVH_SAMPLE: u32 = 12;
+/// Dwords of one kept difference ([`HW_BVH_VERIFY`]): kind, address low and
+/// high, the software's four, the hardware's four, the page; the ray's
+/// origin, direction, inverse direction and extent; two unused.
+pub const HW_BVH_SAMPLE: u32 = 24;
+/// Dword of the tail past [`MEMORY_FAULTS`] that counts box answers with the
+/// same children in another order ([`HW_BVH_VERIFY`]; dwords 1-3 count
+/// those with other children, and triangles).
+pub const HW_BVH_ORDER_ONLY: u32 = 4;
 /// Where in the tail the kept differences start ([`HW_BVH_VERIFY`]); dword 7
 /// of the tail counts them.
 pub const HW_BVH_SAMPLES_AT: u32 = 8;

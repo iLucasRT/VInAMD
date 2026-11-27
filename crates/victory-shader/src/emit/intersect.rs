@@ -152,7 +152,7 @@ impl<'a> Lower<'a> {
                 *w = self.i32_of(v)?;
             }
             let (low, high) = self.bvh_address(words[0], words[1], pointer, pointer_high);
-            let results = self.bvh_hw((low, high, pointer), &ray, sort, guard, hw_op);
+            let results = self.bvh_hw((low, high, pointer), &ray, sort, words[1], guard, hw_op);
             for (k, &r) in results.iter().enumerate() {
                 self.write(inst, Reg::V(dst + k as u8), r, guard);
             }
@@ -261,12 +261,14 @@ impl<'a> Lower<'a> {
         (low, high, pointer): (V, V, V),
         ray: &Ray,
         sort: bool,
+        word1: V,
         guard: Option<V>,
         opcode: u8,
     ) -> Vec<V> {
         use super::super::bitcode::Tag;
         use super::super::shader::{
-            HW_BVH_BOXES, HW_BVH_SAMPLE, HW_BVH_SAMPLES_AT, HW_BVH_TRIANGLES, HW_BVH_VERIFY,
+            HW_BVH_BOXES, HW_BVH_CLAMP_INVERSE, HW_BVH_GROW, HW_BVH_NORMALIZE, HW_BVH_ORDER_ONLY,
+            HW_BVH_SAMPLE, HW_BVH_SAMPLES_AT, HW_BVH_TRIANGLES, HW_BVH_VERIFY,
             MEMORY_FAULTS, MEMORY_HW_BVH_CONTROL, MEMORY_PAGES, MEMORY_VA_OFFSET, SLOT_AMD_EXT,
             SLOT_FAULTS, SLOT_MEMORY,
         };
@@ -488,6 +490,29 @@ impl<'a> Lower<'a> {
         let phase1 = self.s.m.i32(0x5100_0000 | u32::from(opcode));
         // AmdExtIntersectBvhNodeFlag_BoxSortEnable (1) | ReturnBarycentrics (2)
         let flags_val = self.s.m.i32(u32::from(sort) | 2);
+        let bit_set = |l: &mut Self, bit: u32| {
+            let b = l.s.m.i32(bit);
+            let on = l.s.m.bin(hw_block, Bin::And, control, b);
+            l.s.m.cmp(hw_block, pred::NE, on, zero)
+        };
+        // (`HW_BVH_CLAMP_INVERSE`) As the software holds it.
+        let clamping = bit_set(self, HW_BVH_CLAMP_INVERSE);
+        let (most, least) = (
+            self.s.m.f32(f32::MAX.to_bits()),
+            self.s.m.f32((-f32::MAX).to_bits()),
+        );
+        let inverse: [V; 3] = std::array::from_fn(|a| {
+            let x = ray.inverse[a];
+            let held = self.binary(35, x, least);
+            let held = self.binary(36, held, most);
+            self.s.m.select(hw_block, clamping, held, x)
+        });
+        // (`HW_BVH_GROW`) The descriptor's growth of the boxes.
+        let growing = bit_set(self, HW_BVH_GROW);
+        let (k23, kff) = (self.s.m.i32(23), self.s.m.i32(0xFF));
+        let grow = self.s.m.bin(hw_block, Bin::LShr, word1, k23);
+        let grow = self.s.m.bin(hw_block, Bin::And, grow, kff);
+        let expansion = self.s.m.select(hw_block, growing, grow, zero);
         let inputs: [V; 14] = [
             ptr_lo,
             ptr_hi,
@@ -498,11 +523,11 @@ impl<'a> Lower<'a> {
             self.as_int(ray.direction[0]),
             self.as_int(ray.direction[1]),
             self.as_int(ray.direction[2]),
-            self.as_int(ray.inverse[0]),
-            self.as_int(ray.inverse[1]),
-            self.as_int(ray.inverse[2]),
+            self.as_int(inverse[0]),
+            self.as_int(inverse[1]),
+            self.as_int(inverse[2]),
             flags_val,
-            zero,
+            expansion,
         ];
         for (idx, &val) in inputs.iter().enumerate() {
             let idx_v = self.s.m.i32(idx as u32);
@@ -526,6 +551,46 @@ impl<'a> Lower<'a> {
                 &[uav, phase1, iu, iu, idx_v, zero],
             )
         });
+        // (`HW_BVH_NORMALIZE`) A triangle's answer in the software's form.
+        let hw_raw = hw_out;
+        let hw_out: [V; 4] = {
+            let normalizing = {
+                let b = self.s.m.i32(HW_BVH_NORMALIZE);
+                let on = self.s.m.bin(hw_block, Bin::And, control, b);
+                let on = self.s.m.cmp(hw_block, pred::NE, on, zero);
+                let tri = self.s.m.cmp(hw_block, pred::IULT, kind, k4);
+                self.s.m.bin(hw_block, Bin::And, on, tri)
+            };
+            let [tn, d, inum, jnum] = hw_raw.map(|v| self.as_float(v));
+            let ad = self.unary(6, d);
+            let atn = self.unary(6, tn);
+            let (one, minus_one, fzero, inf) = (
+                self.s.m.f32(1f32.to_bits()),
+                self.s.m.f32((-1f32).to_bits()),
+                self.s.m.f32(0),
+                self.s.m.f32(f32::INFINITY.to_bits()),
+            );
+            let over = self.s.m.bin(hw_block, Bin::SDiv, one, ad);
+            let t = self.s.m.bin(hw_block, Bin::Mul, tn, over);
+            let i = self.s.m.bin(hw_block, Bin::Mul, inum, over);
+            let j = self.s.m.bin(hw_block, Bin::Mul, jnum, over);
+            let negative = self.s.m.cmp(hw_block, pred::OLT, d, fzero);
+            let sign = self.s.m.select(hw_block, negative, minus_one, one);
+            let inf_t = self.s.m.cmp(hw_block, pred::OEQ, atn, inf);
+            let flat = self.s.m.cmp(hw_block, pred::OEQ, ad, fzero);
+            let missed = self.s.m.bin(hw_block, Bin::Or, inf_t, flat);
+            let form = [
+                self.s.m.select(hw_block, missed, inf, t),
+                self.s.m.select(hw_block, missed, one, sign),
+                self.s.m.select(hw_block, missed, fzero, i),
+                self.s.m.select(hw_block, missed, fzero, j),
+            ];
+            std::array::from_fn(|k| {
+                let v = self.as_int(form[k]);
+                self.s.m.select(hw_block, normalizing, v, hw_raw[k])
+            })
+        };
+
         // (`HW_BVH_VERIFY`) The software's answer too: used, and a
         // difference counted.
         let mut checked: Option<([V; 4], usize)> = None;
@@ -578,10 +643,54 @@ impl<'a> Lower<'a> {
                 let d = self.s.m.cmp(v_cmp, pred::NE, sw[k], hw_out[k]);
                 differs = self.s.m.bin(v_cmp, Bin::Or, differs, d);
             }
+            // For a box: the same children in another order? Every one of
+            // either answer is in the other.
+            let mut same_set: Option<V> = None;
+            for (a, b) in [(sw, hw_out), (hw_out, sw)] {
+                for &x in a.iter() {
+                    let mut found: Option<V> = None;
+                    for &y in b.iter() {
+                        let e = self.s.m.cmp(v_cmp, pred::EQ, x, y);
+                        found = Some(match found {
+                            Some(f) => self.s.m.bin(v_cmp, Bin::Or, f, e),
+                            None => e,
+                        });
+                    }
+                    let found = found.expect("four");
+                    same_set = Some(match same_set {
+                        Some(s) => self.s.m.bin(v_cmp, Bin::And, s, found),
+                        None => found,
+                    });
+                }
+            }
+            let same_set = same_set.expect("eight");
+            let is_box_kind = self.s.m.cmp(v_cmp, pred::IUGE, kind, k4);
+            let order_only = self.s.m.bin(v_cmp, Bin::And, same_set, is_box_kind);
+            let order_only = self.s.m.bin(v_cmp, Bin::And, order_only, differs);
+            let (v_order, v_other) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s
+                .m
+                .terminate(v_cmp, Term::CondBr(order_only, v_order, v_other));
+            self.cur = v_order;
+            {
+                let faults = self.s.root_uav_handle(SLOT_FAULTS);
+                let at = self.s.m.i32((MEMORY_FAULTS + HW_BVH_ORDER_ONLY) * 4);
+                let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
+                self.s.op(
+                    v_order,
+                    "atomicBinOp.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    78,
+                    &[faults, add, at, iu, iu, one],
+                );
+            }
+            self.cur = v_other;
             let (v_note, v_done) = (self.s.m.new_block(), self.s.m.new_block());
             self.s
                 .m
-                .terminate(v_cmp, Term::CondBr(differs, v_note, v_done));
+                .terminate(v_other, Term::CondBr(differs, v_note, v_done));
+            self.s.m.terminate(v_order, Term::Br(v_done));
             // A difference: counted by kind (16-bit box, 32-bit box,
             // triangle), the first few kept whole.
             self.cur = v_note;
@@ -625,7 +734,24 @@ impl<'a> Lower<'a> {
             let first = self.s.m.i32((MEMORY_FAULTS + HW_BVH_SAMPLES_AT) * 4);
             let off = self.s.m.bin(v_keep, Bin::Mul, n, size);
             let off = self.s.m.bin(v_keep, Bin::Add, off, first);
-            let words = [kind, low, high, sw[0], sw[1], sw[2], sw[3], hw_out[0], hw_out[1], hw_out[2], hw_out[3], page];
+            let r = |l: &mut Self, f: V| l.as_int(f);
+            let ray_words = [
+                r(self, ray.origin[0]),
+                r(self, ray.origin[1]),
+                r(self, ray.origin[2]),
+                r(self, ray.direction[0]),
+                r(self, ray.direction[1]),
+                r(self, ray.direction[2]),
+                r(self, ray.inverse[0]),
+                r(self, ray.inverse[1]),
+                r(self, ray.inverse[2]),
+                r(self, ray.extent),
+            ];
+            let words = [
+                kind, low, high, sw[0], sw[1], sw[2], sw[3], hw_out[0], hw_out[1], hw_out[2], hw_out[3], page,
+                ray_words[0], ray_words[1], ray_words[2], ray_words[3], ray_words[4], ray_words[5],
+                ray_words[6], ray_words[7], ray_words[8], ray_words[9], zero, zero,
+            ];
             let all = self.s.m.i8(15);
             for (q, chunk) in words.chunks(4).enumerate() {
                 let at = self.s.m.i32(q as u32 * 16);
