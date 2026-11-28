@@ -674,6 +674,14 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         // SAFETY: looks up the function table entry covering `Rip`, if any.
         let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
         if entry.is_null() {
+            // Code of no module (our stubs near the title's, which push
+            // registers before anything else): no table says how its frame
+            // is laid out, and taking it for a leaf put garbage in the
+            // registers the next frame's unwind codes read (a profile
+            // crashed in `RtlVirtualUnwind` reading address 0x48d, run YP49).
+            if module_of(context.Rip as usize).is_none() {
+                break;
+            }
             // SAFETY: `rsp` is inside this thread's stack.
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
