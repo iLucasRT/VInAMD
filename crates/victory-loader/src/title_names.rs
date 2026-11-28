@@ -135,18 +135,34 @@ unsafe extern "system" fn tunable(hash: u32, default: f32, ret: usize) -> f32 {
     value
 }
 
+/// Told when the title starts (`Some`) and ends (`None`) loading an effect
+/// on the calling thread (the app passes `victory_gpu::effect_loading`, so
+/// pipelines made meanwhile can be put down to the effect).
+static ON_LOADING: std::sync::OnceLock<fn(Option<&str>)> = std::sync::OnceLock::new();
+
+/// Sets what [`ON_LOADING`] calls.
+pub fn on_effect_loading(f: fn(Option<&str>)) {
+    let _ = ON_LOADING.set(f);
+}
+
 /// The hook of the effect loader (reached from its stub, `ret` in `r8`).
 unsafe extern "system" fn effect(name: *const c_char, flags: u32, ret: usize) -> usize {
     // SAFETY: set to the trampoline before the jump to this hook is written.
     let original: EffectFn = unsafe { std::mem::transmute::<usize, EffectFn>(EFFECT_ORIGINAL.load(Ordering::Acquire)) };
-    // SAFETY: the title's own call, passed on as it came.
-    let address = unsafe { original(name, flags) };
     let text = if name.is_null() {
         String::from("(null)")
     } else {
         // SAFETY: the title passes a C string (it hashes it the same way).
         unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
     };
+    if let Some(f) = ON_LOADING.get() {
+        f(Some(&text));
+    }
+    // SAFETY: the title's own call, passed on as it came.
+    let address = unsafe { original(name, flags) };
+    if let Some(f) = ON_LOADING.get() {
+        f(None);
+    }
     let programs = if address == 0 {
         0
     } else {

@@ -13,8 +13,21 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Containers by title address: stage, length, hash.
-static SEEN: Mutex<Option<HashMap<usize, (&'static str, usize, String)>>> = Mutex::new(None);
+/// Containers by title address: stage, length, hash, and the effect the
+/// title was loading on that thread when the pipeline was made, if any.
+static SEEN: Mutex<Option<HashMap<usize, (&'static str, usize, String, Option<std::sync::Arc<str>>)>>> = Mutex::new(None);
+
+thread_local! {
+    /// The effect the title is loading by name on this thread
+    /// (`victory_loader::title_names` tells, around the loader's call).
+    static LOADING: std::cell::RefCell<Option<std::sync::Arc<str>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The title starts (`Some`) or ends (`None`) loading an effect by name on
+/// this thread.
+pub fn effect_loading(name: Option<&str>) {
+    LOADING.with(|l| *l.borrow_mut() = name.map(std::sync::Arc::from));
+}
 static DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// The file, once asked for; the writer starts with the first note.
@@ -44,7 +57,8 @@ pub(crate) fn note(stage: &'static str, at: usize, len: usize, hash: &str) {
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = seen.get_or_insert_with(HashMap::new);
     if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(at) {
-        e.insert((stage, len, hash.to_owned()));
+        let effect = LOADING.with(|l| l.borrow().clone());
+        e.insert((stage, len, hash.to_owned(), effect));
         DIRTY.store(true, Ordering::Relaxed);
     }
 }
@@ -57,9 +71,13 @@ fn write(file: &std::path::Path) {
         let Some(seen) = seen.as_ref() else { return };
         let mut all: Vec<_> = seen.iter().collect();
         all.sort_by_key(|(at, _)| **at);
-        let _ = writeln!(text, "# VICTORY_PIPELINE_SHADERS: {} containers. shader <stage> <title address> <bytes> <hash>", all.len());
-        for (at, (stage, len, hash)) in all {
-            let _ = writeln!(text, "shader {stage} {at:#x} {len} {hash}");
+        let _ = writeln!(
+            text,
+            "# VICTORY_PIPELINE_SHADERS: {} containers. shader <stage> <title address> <bytes> <hash> <effect being loaded on the thread, or ->",
+            all.len()
+        );
+        for (at, (stage, len, hash, effect)) in all {
+            let _ = writeln!(text, "shader {stage} {at:#x} {len} {hash} {}", effect.as_deref().unwrap_or("-"));
         }
     }
     let tmp = file.with_extension("tmp");
