@@ -562,9 +562,10 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
         return None;
     }
     // SAFETY: the title passes `size` bytes of shader code.
-    Some(shader(stage, unsafe {
-        std::slice::from_raw_parts(code.code, code.size)
-    }))
+    let made = shader(stage, unsafe { std::slice::from_raw_parts(code.code, code.size) });
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::shader_sources::note(stage, code.code as usize, code.size, &made.hash);
+    Some(made)
 }
 
 fn hand_out(

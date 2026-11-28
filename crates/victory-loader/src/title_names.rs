@@ -153,8 +153,72 @@ unsafe extern "system" fn effect(name: *const c_char, flags: u32, ret: usize) ->
         // SAFETY: the effect the loader returned; the title reads this field too.
         unsafe { ((address + EFFECT_PROGRAMS) as *const u16).read_unaligned() }
     };
+    if address != 0 {
+        dump_effect(&text, address, programs);
+    }
     note_effect(text, address, programs, ret);
     address
+}
+
+/// Where effect dumps go (`<VICTORY_TITLE_NAMES>.effects.txt`), once set.
+static DUMPS: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// What the title's memory holds at `at`, `len` bytes, if all of it is there
+/// (read as another process would: a page that is not there fails the read).
+fn read_title(at: usize, len: usize) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut out = vec![0u8; len];
+    let mut got = 0usize;
+    // SAFETY: our own process; the kernel checks the source and copies into
+    // a buffer of `len` bytes.
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, out.as_mut_ptr().cast(), len, &mut got) };
+    (ok != 0 && got == len).then_some(out)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// (Once per effect name) The effect's first 0xd00 bytes, its program array
+/// (`+0xc80`, `programs` of them, 0x100 bytes each taken), and 0x100 bytes at
+/// each 8-byte value of that array that points into memory: to find, from a
+/// run, how an effect's programs lead to the shader code its pipelines are
+/// made from (`VICTORY_PIPELINE_SHADERS` writes that side).
+fn dump_effect(name: &str, address: usize, programs: u16) {
+    use std::io::Write as _;
+    static DONE: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let Some(file) = DUMPS.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return;
+    };
+    if !DONE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(name.to_owned()) {
+        return;
+    }
+    let mut text = String::new();
+    let Some(head) = read_title(address, 0xd00) else {
+        return;
+    };
+    text += &format!("effect {name} {address:#x} {programs} {}
+", hex(&head));
+    let array = u64::from_le_bytes(head[0xc80..0xc88].try_into().expect("8 bytes")) as usize;
+    let n = usize::from(programs).min(256);
+    if let Some(entries) = (array != 0 && n != 0).then(|| read_title(array, n * 0x100)).flatten() {
+        text += &format!("array {name} {array:#x} {}
+", hex(&entries));
+        for (k, word) in entries.chunks_exact(8).enumerate() {
+            let p = u64::from_le_bytes(word.try_into().expect("8 bytes")) as usize;
+            if !(0x10000..0x8000_0000_0000).contains(&p) {
+                continue;
+            }
+            if let Some(at) = read_title(p, 0x100) {
+                text += &format!("points {name} {:#x} {p:#x} {}
+", k * 8, hex(&at));
+            }
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+        let _ = f.write_all(text.as_bytes());
+    }
 }
 
 /// The stub near the title's code at `stub`: the caller's return address
@@ -274,6 +338,13 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         return;
     };
     BASE.store(base, Ordering::Relaxed);
+    {
+        let mut dumps = file.clone().into_os_string();
+        dumps.push(".effects.txt");
+        let dumps = std::path::PathBuf::from(dumps);
+        let _ = std::fs::remove_file(&dumps);
+        *DUMPS.lock().unwrap_or_else(|e| e.into_inner()) = Some(dumps);
+    }
     let mut hooked = 0;
     for (what, (offset, bytes), hook, original) in [
         ("tunable lookup", TUNABLE, tunable as *const () as usize, &TUNABLE_ORIGINAL),

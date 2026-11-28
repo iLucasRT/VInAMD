@@ -92,6 +92,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod shader_sources;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
